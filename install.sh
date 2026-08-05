@@ -74,9 +74,17 @@ echo
 echo "${bold}Installing${rst}"
 mkdir -p "$CMDS"
 
-fetch() { # fetch <remote-path> <dest>
-  if [[ -f "$(dirname "$0")/$1" ]]; then
-    cp "$(dirname "$0")/$1" "$2"
+# Only prefer local files when this script is genuinely running from a clone.
+# Piped through `curl | bash` there is no script file, and $0 is just "bash" —
+# resolving that to "." would copy whatever happens to sit in the cwd.
+SELF_DIR=""
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fi
+
+fetch() { # fetch <repo-relative-path> <dest>
+  if [[ -n "$SELF_DIR" && -f "$SELF_DIR/$1" ]]; then
+    cp "$SELF_DIR/$1" "$2"
   else
     curl -fsSL "$RAW/$1" -o "$2"
   fi
