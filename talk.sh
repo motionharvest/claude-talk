@@ -6,15 +6,32 @@
 #   talk.sh                 speak the last response
 #   talk.sh stop            stop playback
 #   talk.sh --print         print what would be spoken, don't speak
+#   talk.sh --engine NAME   auto | xtts | edge
 #   talk.sh --voice NAME    use a different voice for this run
+#   talk.sh --speaker FILE  clone the voice in a wav clip (xtts only)
+#   talk.sh --lang CODE     language of the text (xtts only, default en)
 #   talk.sh --rate +30%     speed up / slow down for this run
+#   talk.sh --warm          load the xtts model now, before you need it
 #   talk.sh --list-voices   list available voices
 #   talk.sh --doctor        check dependencies and audio setup
 #
+# Engines:
+#   xtts   XTTS-v2 on this machine. No network, clonable voices, needs a GPU
+#          to run faster than real time. Install it with xtts/install-xtts.sh.
+#   edge   Microsoft's cloud voices through edge-tts. Needs a network.
+#   auto   xtts when it is installed, edge otherwise.
+#
 # Config: environment variables, or ~/.config/claude-talk/config (shell syntax)
-#   TALK_VOICE          default en-US-AriaNeural
+#   TALK_ENGINE            default auto
+#   TALK_VOICE             default en-US-AriaNeural   edge voice name
+#   TALK_XTTS_VOICE        default Claribel Dervla    built-in xtts speaker
+#   TALK_XTTS_SPEAKER_WAV  6-30s wav to clone instead of a built-in speaker
+#   TALK_XTTS_LANG         default en
+#   TALK_XTTS_SPEED        overrides TALK_RATE for xtts; 1.0 is normal
+#   TALK_XTTS_IDLE         default 900   seconds idle before the model unloads
+#   TALK_XTTS_PYTHON       python of the xtts venv
 #   TALK_RATE           default +18%      e.g. +40% faster, -10% slower
-#   TALK_PITCH          default +0Hz
+#   TALK_PITCH          default +0Hz      (edge only)
 #   TALK_MAXLEN         default 6000      chars before truncating
 #   TALK_PLAYER         auto | windows | linux | macos
 #   TALK_LATENCY_MSEC   default 200       PulseAudio buffer (Linux route)
@@ -24,22 +41,54 @@ set -uo pipefail
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claude-talk/config"
 [[ -f "$CONFIG" ]] && . "$CONFIG"
 
+ENGINE="${TALK_ENGINE:-auto}"
 VOICE="${TALK_VOICE:-en-US-AriaNeural}"
+XTTS_VOICE="${TALK_XTTS_VOICE:-Claribel Dervla}"
+XTTS_SPEAKER_WAV="${TALK_XTTS_SPEAKER_WAV:-}"
+XTTS_LANG="${TALK_XTTS_LANG:-en}"
+XTTS_SPEED="${TALK_XTTS_SPEED:-}"
 RATE="${TALK_RATE:-+18%}"
 PITCH="${TALK_PITCH:-+0Hz}"
 MAXLEN="${TALK_MAXLEN:-6000}"
 PLAYER="${TALK_PLAYER:-auto}"
 
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+XTTS_PYTHON="${TALK_XTTS_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-talk/venv/bin/python}"
+XTTS_SERVER="${TALK_XTTS_SERVER:-}"
+if [[ -z "$XTTS_SERVER" ]]; then
+  for _c in "$HOME/.claude/talk-xtts.py" "$SELF_DIR/talk-xtts.py" "$SELF_DIR/xtts/xtts_server.py"; do
+    [[ -f "$_c" ]] && { XTTS_SERVER="$_c"; break; }
+  done
+fi
+
 STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/claude-talk"
 PIDFILE="$STATE_DIR/play.pid"
-AUDIO="$STATE_DIR/last.mp3"
-WAV="$STATE_DIR/last.wav"
+AUDIO="$STATE_DIR/speech.mp3"
+PLAYWAV="$STATE_DIR/play.wav"
+SPEAKFILE="$STATE_DIR/speak.txt"
 ERRLOG="$STATE_DIR/err.log"
 PRINT_ONLY=0
+VOICE_OVERRIDE=""
+ENGINE_USED=""
+VOICE_USED=""
+DO_DOCTOR=0
+DO_LIST=0
+DO_WARM=0
 
 mkdir -p "$STATE_DIR"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# XTTS is usable only when both its virtualenv and its server script are present.
+xtts_ready() { [[ -n "$XTTS_SERVER" && -f "$XTTS_SERVER" && -x "$XTTS_PYTHON" ]]; }
+
+active_engine() {
+  case "$ENGINE" in
+    xtts|edge) printf '%s' "$ENGINE" ;;
+    auto)      xtts_ready && printf 'xtts' || printf 'edge' ;;
+    *)         printf 'edge' ;;
+  esac
+}
 
 case "$(uname -s)" in
   Darwin) PLATFORM=macos ;;
@@ -56,7 +105,7 @@ stop_playback() {
   # Anchored on the player binary so this can never match the shell running it.
   local p
   for p in ffplay mpv paplay pw-play afplay aplay mpg123; do
-    pkill -f "^([^ ]*/)?$p .*claude-talk/last\." 2>/dev/null
+    pkill -f "^([^ ]*/)?$p .*claude-talk/(speech|play)\." 2>/dev/null
   done
   # WSL interop shows the Windows player as "/init /mnt/c/.../powershell.exe ..."
   pkill -f "^(/init )?([^ ]*/)?powershell\.exe .*claude-talk\.wav" 2>/dev/null
@@ -64,9 +113,29 @@ stop_playback() {
 }
 
 doctor() {
+  local engine; engine=$(active_engine)
   echo "platform:   $PLATFORM"
   echo "player:     $PLAYER"
-  echo "voice:      $VOICE   rate: $RATE   pitch: $PITCH"
+  echo "engine:     $ENGINE -> $engine"
+  echo "rate:       $RATE   pitch: $PITCH   maxlen: $MAXLEN"
+  echo
+  echo "edge voice: $VOICE"
+  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
+    echo "xtts voice: $XTTS_SPEAKER_WAV (cloned)   lang: $XTTS_LANG"
+  else
+    echo "xtts voice: $XTTS_VOICE   lang: $XTTS_LANG"
+  fi
+  echo
+  if xtts_ready; then
+    echo "xtts:       installed"
+    echo "  python    $XTTS_PYTHON"
+    echo "  server    $XTTS_SERVER"
+    "$XTTS_PYTHON" "$XTTS_SERVER" status 2>&1 | sed 's/^/  /'
+  else
+    echo "xtts:       NOT installed — run xtts/install-xtts.sh"
+    [[ -n "$XTTS_SERVER" ]] && echo "  server    $XTTS_SERVER"
+    [[ -x "$XTTS_PYTHON" ]] || echo "  python    $XTTS_PYTHON (missing)"
+  fi
   echo
   for c in jq python3 edge-tts ffmpeg; do
     printf '%-12s %s\n' "$c" "$(have "$c" && command -v "$c" || echo 'MISSING')"
@@ -105,20 +174,52 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     stop|--stop)   stop_playback; echo "Playback stopped."; exit 0 ;;
     --print)       PRINT_ONLY=1; shift ;;
-    --voice)       VOICE="${2:-$VOICE}"; shift 2 ;;
+    --engine)      ENGINE="${2:-$ENGINE}"; shift 2 ;;
+    --voice)       VOICE_OVERRIDE="${2:-}"; VOICE="${2:-$VOICE}"; shift 2 ;;
+    --speaker)     XTTS_SPEAKER_WAV="${2:-}"; shift 2 ;;
+    --lang)        XTTS_LANG="${2:-$XTTS_LANG}"; shift 2 ;;
     --rate)        RATE="${2:-$RATE}"; shift 2 ;;
+    --speed)       XTTS_SPEED="${2:-$XTTS_SPEED}"; shift 2 ;;
     --pitch)       PITCH="${2:-$PITCH}"; shift 2 ;;
     --player)      PLAYER="${2:-$PLAYER}"; shift 2 ;;
-    --list-voices) edge-tts --list-voices; exit 0 ;;
-    --doctor)      doctor; exit 0 ;;
-    -h|--help)     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --warm)        DO_WARM=1; shift ;;
+    --list-voices) DO_LIST=1; shift ;;
+    --doctor)      DO_DOCTOR=1; shift ;;
+    -h|--help)     awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0 ;;
     *)             shift ;;
   esac
 done
 
+case "$ENGINE" in
+  auto|xtts|edge) ;;
+  *) echo "talk: unknown engine '$ENGINE' — use auto, xtts or edge" >&2; exit 1 ;;
+esac
+
+if [[ "$DO_DOCTOR" -eq 1 ]]; then doctor; exit 0; fi
+
+if [[ "$DO_WARM" -eq 1 ]]; then
+  xtts_ready || { echo "talk: xtts is not installed — run xtts/install-xtts.sh" >&2; exit 1; }
+  exec "$XTTS_PYTHON" "$XTTS_SERVER" preload
+fi
+
+if [[ "$DO_LIST" -eq 1 ]]; then
+  if [[ "$(active_engine)" == xtts ]]; then
+    exec "$XTTS_PYTHON" "$XTTS_SERVER" speakers
+  fi
+  have edge-tts || { echo "talk: edge-tts not found — pip install edge-tts" >&2; exit 1; }
+  exec edge-tts --list-voices
+fi
+
 have jq       || { echo "talk: jq not found"      >&2; exit 1; }
 have python3  || { echo "talk: python3 not found" >&2; exit 1; }
-have edge-tts || { echo "talk: edge-tts not found — pip install edge-tts" >&2; exit 1; }
+if [[ "$(active_engine)" == edge ]] && ! have edge-tts; then
+  if [[ "$ENGINE" == auto ]]; then
+    echo "talk: no engine available — install xtts (xtts/install-xtts.sh) or edge-tts (pip install edge-tts)" >&2
+  else
+    echo "talk: edge-tts not found — pip install edge-tts" >&2
+  fi
+  exit 1
+fi
 
 TRANSCRIPT=$(find_transcript)
 [[ -f "$TRANSCRIPT" ]] || { echo "talk: could not find session transcript" >&2; exit 1; }
@@ -191,7 +292,7 @@ PY
 
 if [[ "$PRINT_ONLY" -eq 1 ]]; then printf '%s\n' "$TEXT"; exit 0; fi
 
-announce() { echo "Speaking $(wc -w <<<"$TEXT" | tr -d ' ') words as ${VOICE}. (/talk stop to interrupt)"; }
+announce() { echo "Speaking $(wc -w <<<"$TEXT" | tr -d ' ') words as ${VOICE_USED} via ${ENGINE_USED}. (/talk stop to interrupt)"; }
 bg() { nohup "$@" >/dev/null 2>&1 & echo $! > "$PIDFILE"; disown 2>/dev/null; }
 
 # --- offline fallback ------------------------------------------------------
@@ -221,16 +322,70 @@ speak_offline() {
 }
 
 # --- synthesize ------------------------------------------------------------
-stop_playback
-rm -f "$AUDIO" "$WAV"
-if ! timeout 120 edge-tts --voice "$VOICE" --rate "$RATE" --pitch "$PITCH" \
-      --text "$TEXT" --write-media "$AUDIO" >/dev/null 2>"$ERRLOG"; then
-  speak_offline && exit 0
+# TALK_RATE is an edge-tts percentage. XTTS takes a speed multiplier instead,
+# so "+18%" becomes 1.18 and the one config knob drives both engines.
+rate_to_speed() {
+  local raw="${RATE//[%+[:space:]]/}"
+  [[ -n "$raw" ]] || raw=0
+  awk -v r="$raw" 'BEGIN { s = 1 + r / 100; if (s < 0.5) s = 0.5; if (s > 2.0) s = 2.0; printf "%.3f", s }'
+}
+
+synth_xtts() {
+  xtts_ready || return 1
+  AUDIO="$STATE_DIR/speech.wav"
+  local speed voice
+  speed="${XTTS_SPEED:-$(rate_to_speed)}"
+  voice="${VOICE_OVERRIDE:-$XTTS_VOICE}"
+  local args=(say --text-file "$SPEAKFILE" --out "$AUDIO"
+              --language "$XTTS_LANG" --speed "$speed")
+  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
+    args+=(--speaker-wav "$XTTS_SPEAKER_WAV")
+  else
+    args+=(--speaker "$voice")
+  fi
+  printf '%s' "$TEXT" > "$SPEAKFILE" || return 1
+  timeout "${TALK_XTTS_TIMEOUT:-900}" "$XTTS_PYTHON" "$XTTS_SERVER" "${args[@]}" \
+    >/dev/null 2>"$ERRLOG" || return 1
+  [[ -s "$AUDIO" ]] || return 1
+  ENGINE_USED="XTTS-v2"
+  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
+    VOICE_USED="$(basename "$XTTS_SPEAKER_WAV")"
+  else
+    VOICE_USED="$voice"
+  fi
+  return 0
+}
+
+synth_edge() {
+  have edge-tts || return 1
+  AUDIO="$STATE_DIR/speech.mp3"
+  timeout 120 edge-tts --voice "$VOICE" --rate "$RATE" --pitch "$PITCH" \
+    --text "$TEXT" --write-media "$AUDIO" >/dev/null 2>"$ERRLOG" || return 1
+  [[ -s "$AUDIO" ]] || return 1
+  ENGINE_USED="edge-tts"
+  VOICE_USED="$VOICE"
+  return 0
+}
+
+synthesis_failed() {
   echo "talk: synthesis failed" >&2
-  tail -3 "$ERRLOG" >&2
+  tail -5 "$ERRLOG" >&2
   exit 1
-fi
-[[ -s "$AUDIO" ]] || { echo "talk: no audio produced" >&2; exit 1; }
+}
+
+stop_playback
+rm -f "$STATE_DIR/speech.mp3" "$STATE_DIR/speech.wav" "$PLAYWAV"
+: > "$ERRLOG"
+
+case "$ENGINE" in
+  xtts)
+    xtts_ready || { echo "talk: xtts is not installed — run xtts/install-xtts.sh" >&2; exit 1; }
+    synth_xtts || { echo "talk: XTTS synthesis failed" >&2; tail -5 "$ERRLOG" >&2; exit 1; } ;;
+  edge)
+    synth_edge || { speak_offline && exit 0; synthesis_failed; } ;;
+  auto)
+    synth_xtts || synth_edge || { speak_offline && exit 0; synthesis_failed; } ;;
+esac
 
 # --- playback --------------------------------------------------------------
 # On WSL the Linux sink is WSLg's RDPSink, which streams audio to Windows over
@@ -266,15 +421,15 @@ play_linux() {
   if have ffmpeg && { have paplay || have pw-play; }; then
     if ffmpeg -y -loglevel error -i "$AUDIO" \
          -af "aresample=resampler=soxr:precision=28:osf=s16" \
-         -ar "$rate" -ac "$ch" -c:a pcm_s16le "$WAV" 2>>"$ERRLOG"; then
+         -ar "$rate" -ac "$ch" -c:a pcm_s16le "$PLAYWAV" 2>>"$ERRLOG"; then
       export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
-      have pw-play && { bg pw-play "$WAV"; return 0; }
-      bg paplay "$WAV"; return 0
+      have pw-play && { bg pw-play "$PLAYWAV"; return 0; }
+      bg paplay "$PLAYWAV"; return 0
     fi
   fi
   have mpv    && { bg mpv --no-video --really-quiet "$AUDIO"; return 0; }
   have ffplay && { bg ffplay -nodisp -autoexit -loglevel quiet "$AUDIO"; return 0; }
-  have mpg123 && { bg mpg123 -q "$AUDIO"; return 0; }
+  [[ "$AUDIO" == *.mp3 ]] && have mpg123 && { bg mpg123 -q "$AUDIO"; return 0; }
   return 1
 }
 

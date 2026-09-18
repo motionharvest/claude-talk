@@ -110,3 +110,6 @@ echo "    ${bold}/talk --doctor${rst}     check your audio setup"
 echo
 echo "${dim}Config: ~/.config/claude-talk/config  (see README)${rst}"
 echo
+echo "${bold}Want local voices instead of cloud voices?${rst}"
+echo "  ./xtts/install-xtts.sh    ${dim}XTTS-v2 on this machine: no network, clonable voices${rst}"
+echo

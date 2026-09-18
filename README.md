@@ -11,6 +11,8 @@ Like `/copy`, but for your ears. Useful when you want to keep reading code while
 /talk --doctor     check your audio setup
 ```
 
+Two speech engines are available. `edge-tts` calls Microsoft's cloud voices and needs a network. XTTS-v2 runs on your own machine, needs no network at speak time, and can clone a voice from a short recording. `/talk` prefers XTTS-v2 when it is installed and falls back to `edge-tts` when it is not.
+
 ## Install
 
 ```bash
@@ -26,6 +28,24 @@ Or clone and run `./install.sh`. Both drop two files into `~/.claude/`:
 
 Start a new session and `/talk` is available. To remove it, run `./uninstall.sh`.
 
+### Local voices with XTTS-v2
+
+The base install uses `edge-tts`. To add the local engine:
+
+```bash
+./xtts/install-xtts.sh
+```
+
+That builds a virtualenv under `~/.local/share/claude-talk/venv`, installs PyTorch and `coqui-tts` into it, downloads the XTTS-v2 checkpoint, and copies the server to `~/.claude/talk-xtts.py`. It asks you to accept the model license first and installs nothing if you decline. Expect roughly 8 GB of disk and a long first run.
+
+Once it is installed, `/talk` uses it by default. `/talk --engine edge` goes back to the cloud voice for one run, and `TALK_ENGINE=edge` makes that permanent.
+
+XTTS-v2 takes ten to twenty seconds to load, so the server holds the model in memory between requests and exits after fifteen minutes of silence. `/talk --warm` loads it ahead of time. The daemon listens on a unix socket in the runtime directory, not on a network port.
+
+**Cloning a voice.** Record 6 to 30 seconds of clean speech as a wav file, then set `TALK_XTTS_SPEAKER_WAV=/path/to/voice.wav`. `/talk --speaker /path/to/voice.wav` does the same for one run. Without a clip, `/talk` uses a built-in speaker, and `/talk --list-voices` names all of them.
+
+**License.** XTTS-v2 is published under the [Coqui Public Model License](https://coqui.ai/cpml), which permits non-commercial use only. `edge-tts` is the engine to use for commercial work.
+
 ### Requirements
 
 | | |
@@ -34,6 +54,8 @@ Start a new session and `/talk` is available. To remove it, run `./uninstall.sh`
 | `jq` | reads the session transcript |
 | `python3` | strips markdown down to speakable prose |
 | `ffmpeg` | recommended; required on WSL |
+
+XTTS-v2 adds its own requirements, all installed into its own virtualenv by `xtts/install-xtts.sh`: PyTorch, `coqui-tts`, and about 2 GB for the checkpoint. A CUDA GPU is optional. On CPU the model runs, and it runs slower than speech plays back, so a long answer will not start immediately.
 
 Plus something to make sound, which you almost certainly already have: `afplay` on macOS, `paplay`/`pw-play`/`ffplay`/`mpv` on Linux, and on WSL nothing extra — it plays through Windows.
 
@@ -44,17 +66,26 @@ Plus something to make sound, which you almost certainly already have: `afplay` 
 Environment variables, or `~/.config/claude-talk/config` (plain shell syntax):
 
 ```bash
-TALK_VOICE=en-US-GuyNeural   # default en-US-AriaNeural
+TALK_ENGINE=auto             # auto | xtts | edge; auto prefers xtts
+TALK_VOICE=en-US-GuyNeural   # default en-US-AriaNeural; edge only
 TALK_RATE=+30%               # default +18%; negative slows down
-TALK_PITCH=-5Hz              # default +0Hz
+TALK_PITCH=-5Hz              # default +0Hz; edge only
 TALK_MAXLEN=6000             # chars before truncating at a sentence boundary
 TALK_PLAYER=auto             # auto | windows | linux | macos
 TALK_LATENCY_MSEC=200        # PulseAudio buffer, Linux route only
+
+TALK_XTTS_VOICE="Ana Florence"        # default "Claribel Dervla"
+TALK_XTTS_SPEAKER_WAV=~/voice.wav     # clone this voice instead
+TALK_XTTS_LANG=en                     # default en
+TALK_XTTS_SPEED=1.2                   # overrides TALK_RATE for xtts
+TALK_XTTS_IDLE=900                    # seconds idle before the model unloads
 ```
 
 Override per-invocation too: `/talk --voice en-GB-RyanNeural --rate +40%`.
 
-`/talk --list-voices` prints every voice edge-tts offers — several hundred, across most languages.
+`TALK_RATE` drives both engines. XTTS takes a multiplier rather than a percentage, so `/talk` converts `+18%` to `1.18` and clamps the result to the range 0.5 to 2.0.
+
+`/talk --list-voices` lists the active engine's voices. For `edge-tts` that is several hundred across most languages. For XTTS-v2 it is the built-in speakers in the checkpoint.
 
 ## How it works
 
@@ -87,6 +118,12 @@ If you're using some other TTS setup on WSL and hearing the same grit, this is v
 **"could not find session transcript".** `CLAUDE_CODE_SESSION_ID` is only set inside Claude Code — expected if you ran `talk.sh` straight from a terminal.
 
 **It spoke the wrong thing.** `/talk --print` shows exactly what the extractor picked up without making any sound.
+
+**XTTS is installed but `/talk` still uses edge.** `/talk --doctor` prints the resolved engine and both paths it looks for. It needs `~/.claude/talk-xtts.py` and an executable python at `~/.local/share/claude-talk/venv/bin/python`.
+
+**XTTS synthesis fails.** Run `~/.local/share/claude-talk/venv/bin/python ~/.claude/talk-xtts.py status` for the model and daemon state. The daemon writes its own log next to the audio, in `$XDG_RUNTIME_DIR/claude-talk/xtts.log`.
+
+**XTTS speech cuts off.** XTTS-v2 truncates any input longer than roughly 250 characters, so the server splits text at sentence boundaries and joins the audio afterwards. A cut-off answer means a chunk was dropped rather than truncated, which the log will show.
 
 ## License
 
