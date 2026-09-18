@@ -16,6 +16,20 @@ The installer checks the host, asks you to accept the model license, builds a vi
 
 Loading XTTS-v2 takes ten to twenty seconds. Paying that on every `/talk` would make the command useless. So `xtts_server.py serve` holds the model in memory and answers requests over a unix socket in `$XDG_RUNTIME_DIR/claude-talk/xtts.sock`. The client starts the daemon on first use and the daemon exits after `TALK_XTTS_IDLE` seconds of inactivity, which defaults to 900. A unix socket rather than a TCP port keeps the engine reachable only by processes that can read the socket file, which is created mode 0600.
 
+## How streaming works
+
+Waiting for a whole answer to render before playing any of it was the single largest cost in the pipeline. A 292-word answer took 32.8 seconds to synthesize, and everything else in `/talk` together took under a second.
+
+So the server no longer returns a finished file. `stream` renders chunk by chunk into a directory as `000.wav`, `001.wav` and so on, writing each under a temporary name and renaming it into place so a reader never sees a partial file. After the last chunk it writes an `END` marker. The call returns as soon as `000.wav` lands, which lets `/talk` start playing while the rest are still rendering.
+
+The opening chunk is capped at 120 characters rather than the usual 220, because nothing is heard until it is done. Later chunks keep the full size, which is more efficient per second of audio.
+
+On the playback side `talk.sh` runs two background loops. A feeder converts each chunk to the sound server's exact format and drops it in a ready directory. A single long-lived player walks the sequence, waiting when it gets ahead and stopping at `END`. One player process for the whole answer means no process start between chunks and no gap the ear can hear.
+
+Synthesis runs roughly twice as fast as speech plays, so the player stays fed after the first chunk. If it ever does not, the audible result is a pause rather than a failure.
+
+`/talk stop` kills both loops and sends `cancel` to the daemon, so a stopped answer stops costing GPU time. The worker checks for cancellation between chunks, so it finishes the chunk already in flight first. That makes a `/talk` issued immediately after a `/talk stop` wait up to about five seconds.
+
 ## Why the text is split
 
 XTTS-v2 truncates any input longer than roughly 250 characters for English. A typical Claude answer is far longer than that, so the server splits the text before synthesis. Splitting happens at sentence boundaries first, at word boundaries only when one sentence is itself too long, and mid-word only when one word is too long. The resulting audio is concatenated with 80 ms of silence between chunks. `split_text` preserves every non-whitespace character of the input, which is checked in the tests below.
@@ -80,8 +94,12 @@ Synthesis is verified against the real checkpoint on one machine: an RTX 4060 La
 
 | | |
 |---|---|
-| cold request, model load included | 22 s |
-| warm request, 10.4 s of audio out | 4.6 s |
-| `/talk` end to end, daemon already warm | 2.6 s |
+| cold `/talk`, model load included | 20.0 s |
+| warm `/talk`, 292-word answer | 1.7 s |
+| warm `/talk`, one-sentence answer | 1.0 s |
+| warm `/talk` issued right after `/talk stop` | 5.7 to 8.7 s |
+| full synthesis of that 292-word answer | 32.8 s |
+
+The last row is what streaming removed from the wait. Before streaming, the same answer took 32.8 seconds to reach the first word on a warm daemon.
 
 Not verified: any other GPU, any CPU-only host, any language other than English, and voice cloning from a reference clip.

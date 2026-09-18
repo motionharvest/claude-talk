@@ -42,6 +42,8 @@ Once it is installed, `/talk` uses it by default. `/talk --engine edge` goes bac
 
 XTTS-v2 takes ten to twenty seconds to load, so the server holds the model in memory between requests and exits after fifteen minutes of silence. `/talk --warm` loads it ahead of time. The daemon listens on a unix socket in the runtime directory, not on a network port.
 
+Playback streams. The server renders the answer in chunks and `/talk` starts playing the first one while the rest are still being made. Synthesis runs about twice as fast as speech plays back, so the player never runs dry. On a warm daemon the first word arrives in under two seconds regardless of how long the answer is. `TALK_STREAM=0` restores the older behaviour of waiting for the complete file.
+
 **Cloning a voice.** Record 6 to 30 seconds of clean speech as a wav file, then set `TALK_XTTS_SPEAKER_WAV=/path/to/voice.wav`. `/talk --speaker /path/to/voice.wav` does the same for one run. Without a clip, `/talk` uses a built-in speaker, and `/talk --list-voices` names all of them.
 
 **License.** XTTS-v2 is published under the [Coqui Public Model License](https://coqui.ai/cpml), which permits non-commercial use only. `edge-tts` is the engine to use for commercial work.
@@ -79,6 +81,7 @@ TALK_XTTS_SPEAKER_WAV=~/voice.wav     # clone this voice instead
 TALK_XTTS_LANG=en                     # default en
 TALK_XTTS_SPEED=1.2                   # overrides TALK_RATE for xtts
 TALK_XTTS_IDLE=900                    # seconds idle before the model unloads
+TALK_STREAM=1                         # 0 waits for the whole file before playing
 ```
 
 Override per-invocation too: `/talk --voice en-GB-RyanNeural --rate +40%`.
@@ -124,6 +127,10 @@ If you're using some other TTS setup on WSL and hearing the same grit, this is v
 **XTTS synthesis fails.** Run `~/.local/share/claude-talk/venv/bin/python ~/.claude/talk-xtts.py status` for the model and daemon state. The daemon writes its own log next to the audio, in `$XDG_RUNTIME_DIR/claude-talk/xtts.log`.
 
 **XTTS speech cuts off.** XTTS-v2 truncates any input longer than roughly 250 characters, so the server splits text at sentence boundaries and joins the audio afterwards. A cut-off answer means a chunk was dropped rather than truncated, which the log will show.
+
+**Speech stutters or pauses mid-answer.** Streaming ran out of chunks, which means synthesis fell behind playback. That happens on CPU rather than GPU. Set `TALK_STREAM=0` to wait for the whole file instead.
+
+**`/talk` right after `/talk stop` is slow.** A cancelled stream finishes the chunk it is already rendering before releasing the model, which costs up to about five seconds. Waiting a moment, or letting the answer finish rather than stopping it, avoids the delay.
 
 ## License
 

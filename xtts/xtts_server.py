@@ -35,6 +35,8 @@ DEFAULT_SPEAKER = "Claribel Dervla"
 DEFAULT_LANGUAGE = "en"
 SAMPLE_RATE = 24000
 CHUNK_LIMIT = 220
+FIRST_CHUNK_LIMIT = 120
+STREAM_FIRST_TIMEOUT = 300.0
 GAP_SECONDS = 0.08
 START_TIMEOUT = 60.0
 REQUEST_TIMEOUT = 900.0
@@ -98,30 +100,56 @@ def _wrap(piece: str, limit: int) -> list[str]:
     return out
 
 
-def split_text(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
+def _pieces(text: str, limit: int) -> list[str]:
+    """Return the atomic pieces of text, none longer than limit."""
+    out: list[str] = []
+    for part in (p.strip() for p in _BOUNDARY.split(text)):
+        if not part:
+            continue
+        out.extend(_wrap(part, limit) if len(part) > limit else [part])
+    return out
+
+
+def split_text(
+    text: str, limit: int = CHUNK_LIMIT, first_limit: int | None = None
+) -> list[str]:
     """Split text into chunks XTTS-v2 can synthesize in one pass.
 
     XTTS-v2 truncates any input over roughly 250 characters, so the caller must
     never hand it a whole response. Splitting happens at sentence boundaries
     first and at word boundaries only when one sentence is itself too long.
+
+    A first_limit shortens the opening chunk only. Streaming playback waits on
+    that chunk before any sound starts, so a short one reaches the ear sooner
+    while the rest keep the full size that makes synthesis efficient.
     """
     chunks: list[str] = []
     current = ""
-    for part in (p.strip() for p in _BOUNDARY.split(text)):
-        if not part:
-            continue
-        pieces = _wrap(part, limit) if len(part) > limit else [part]
-        for piece in pieces:
-            if not current:
-                current = piece
-            elif len(current) + 1 + len(piece) <= limit:
-                current = f"{current} {piece}"
-            else:
-                chunks.append(current)
-                current = piece
+    for piece in _pieces(text, limit):
+        cap = first_limit if (first_limit and not chunks) else limit
+        if not current:
+            current = piece
+        elif len(current) + 1 + len(piece) <= cap:
+            current = f"{current} {piece}"
+        else:
+            chunks.append(current)
+            current = piece
     if current:
         chunks.append(current)
     return chunks
+
+
+def prepare_stream_dir(path: str) -> str:
+    """Empty and return the directory a stream writes its chunks into."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    for stale in directory.iterdir():
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    return str(directory)
 
 
 def write_wav(path: str, samples, rate: int) -> None:
@@ -160,6 +188,9 @@ class Engine:
         self.model = None
         self.sample_rate = SAMPLE_RATE
         self.latents: dict = {}
+        self.lock = threading.Lock()
+        self.token = 0
+        self.stream_dir: str | None = None
 
     def _pick_device(self) -> str:
         """Return cuda when a usable GPU is present, otherwise cpu."""
@@ -267,6 +298,105 @@ class Engine:
         return len(chunks)
 
 
+    def cancel(self) -> None:
+        """Stop any running stream and release its listeners.
+
+        The worker checks the token before each chunk, so a cancel takes effect
+        after at most one more inference. END is written straight away, because
+        a player waiting on the next chunk has to be told that none is coming.
+        """
+        self.token += 1
+        if self.stream_dir:
+            _mark_end(self.stream_dir)
+
+    def start_stream(
+        self,
+        text: str,
+        outdir: str,
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        language: str = DEFAULT_LANGUAGE,
+        speed: float = 1.0,
+        first_limit: int = FIRST_CHUNK_LIMIT,
+    ) -> dict:
+        """Synthesize in the background and return once the first chunk exists.
+
+        Playback can start on chunk zero while the rest are still rendering.
+        Synthesis runs faster than speech plays, so the player stays fed.
+        """
+        self.cancel()
+        outdir = prepare_stream_dir(outdir)
+        self.stream_dir = outdir
+        self.token += 1
+        token = self.token
+        ready = threading.Event()
+        box: dict = {}
+        worker = threading.Thread(
+            target=self._run_stream,
+            args=(text, outdir, speaker, speaker_wav, language, speed,
+                  first_limit, token, ready, box),
+            daemon=True,
+        )
+        worker.start()
+        ready.wait(timeout=STREAM_FIRST_TIMEOUT)
+        if box.get("error"):
+            raise RuntimeError(box["error"])
+        if not ready.is_set():
+            raise RuntimeError("the first chunk did not arrive in time")
+        return {"outdir": outdir, "chunks": box.get("chunks", 0)}
+
+    def _run_stream(
+        self, text, outdir, speaker, speaker_wav, language, speed,
+        first_limit, token, ready, box,
+    ) -> None:
+        """Render every chunk in order, newest first, until cancelled."""
+        import numpy as np
+
+        try:
+            with self.lock:
+                if token != self.token:
+                    return
+                self.load()
+                gpt, embedding = self.conditioning(speaker, speaker_wav)
+                chunks = split_text(text, CHUNK_LIMIT, first_limit)
+                if not chunks:
+                    raise RuntimeError("nothing to speak")
+                box["chunks"] = len(chunks)
+                for index, chunk in enumerate(chunks):
+                    if token != self.token:
+                        break
+                    result = self.model.inference(
+                        text=chunk,
+                        language=language,
+                        gpt_cond_latent=gpt,
+                        speaker_embedding=embedding,
+                        speed=speed,
+                        enable_text_splitting=False,
+                    )
+                    wav = np.asarray(result["wav"], dtype=np.float32).reshape(-1)
+                    final = os.path.join(outdir, f"{index:03d}.wav")
+                    partial = final + ".part"
+                    write_wav(partial, wav, self.sample_rate)
+                    os.replace(partial, final)
+                    if index == 0:
+                        ready.set()
+        except Exception as exc:
+            box["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if token == self.token:
+                _mark_end(outdir)
+            ready.set()
+
+
+def _mark_end(outdir: str) -> None:
+    """Write the marker that tells a player no further chunks are coming."""
+    try:
+        with open(os.path.join(outdir, "END"), "wb"):
+            pass
+    except OSError:
+        pass
+
+
 def _reply(stream, payload: dict) -> None:
     """Write one JSON response line and flush it."""
     stream.write((json.dumps(payload) + "\n").encode("utf-8"))
@@ -301,7 +431,36 @@ def _handle(conn, engine: Engine, state: dict) -> None:
                 _reply(stream, {"ok": True, "device": engine.device})
             elif op == "speakers":
                 _reply(stream, {"ok": True, "speakers": engine.speakers()})
+            elif op == "cancel":
+                engine.cancel()
+                _reply(stream, {"ok": True})
+            elif op == "stream":
+                text = request.get("text") or ""
+                if not text.strip():
+                    raise RuntimeError("no text to speak")
+                started = time.time()
+                info = engine.start_stream(
+                    text=text,
+                    outdir=request.get("outdir") or str(state_dir() / "stream"),
+                    speaker=request.get("speaker"),
+                    speaker_wav=request.get("speaker_wav"),
+                    language=request.get("language") or DEFAULT_LANGUAGE,
+                    speed=float(request.get("speed") or 1.0),
+                    first_limit=int(request.get("first_limit") or FIRST_CHUNK_LIMIT),
+                )
+                _reply(
+                    stream,
+                    {
+                        "ok": True,
+                        "outdir": info["outdir"],
+                        "chunks": info["chunks"],
+                        "seconds": round(time.time() - started, 2),
+                        "device": engine.device,
+                        "rate": engine.sample_rate,
+                    },
+                )
             elif op == "shutdown":
+                engine.cancel()
                 state["stop"] = True
                 _reply(stream, {"ok": True})
             elif op == "synthesize":
@@ -500,6 +659,43 @@ def say(args) -> int:
     return 0
 
 
+def stream(args) -> int:
+    """Start a streaming synthesis and print the directory chunks land in."""
+    text = _read_text(args)
+    if not text.strip():
+        print("talk-xtts: no text to speak", file=sys.stderr)
+        return 1
+    outdir = args.outdir or str(state_dir() / "stream")
+    ensure_daemon(args)
+    reply = talk(
+        Path(args.socket),
+        {
+            "op": "stream",
+            "text": text,
+            "outdir": outdir,
+            "speaker": args.speaker,
+            "speaker_wav": args.speaker_wav,
+            "language": args.language,
+            "speed": args.speed,
+            "first_limit": args.first_limit,
+        },
+    )
+    if not reply.get("ok"):
+        print(f"talk-xtts: {reply.get('error', 'synthesis failed')}", file=sys.stderr)
+        return 1
+    print(reply["outdir"])
+    return 0
+
+
+def cancel(args) -> int:
+    """Stop a running stream without shutting the daemon down."""
+    try:
+        talk(Path(args.socket), {"op": "cancel"}, timeout=10.0)
+    except OSError:
+        return 0
+    return 0
+
+
 def speakers(args) -> int:
     """Print every built-in speaker name, one per line."""
     ensure_daemon(args)
@@ -582,6 +778,21 @@ def build_parser() -> argparse.ArgumentParser:
     say_cmd.add_argument("--speed", type=float, default=1.0)
     say_cmd.add_argument("--device", default=os.environ.get("TALK_XTTS_DEVICE") or None)
     say_cmd.set_defaults(func=say)
+
+    stream_cmd = sub.add_parser("stream", help="synthesize chunk by chunk for playback")
+    stream_cmd.add_argument("--text")
+    stream_cmd.add_argument("--text-file")
+    stream_cmd.add_argument("--outdir")
+    stream_cmd.add_argument("--speaker", default=os.environ.get("TALK_XTTS_VOICE") or DEFAULT_SPEAKER)
+    stream_cmd.add_argument("--speaker-wav", default=os.environ.get("TALK_XTTS_SPEAKER_WAV") or None)
+    stream_cmd.add_argument("--language", default=os.environ.get("TALK_XTTS_LANG") or DEFAULT_LANGUAGE)
+    stream_cmd.add_argument("--speed", type=float, default=1.0)
+    stream_cmd.add_argument("--first-limit", type=int, default=FIRST_CHUNK_LIMIT)
+    stream_cmd.add_argument("--device", default=os.environ.get("TALK_XTTS_DEVICE") or None)
+    stream_cmd.set_defaults(func=stream)
+
+    cancel_cmd = sub.add_parser("cancel", help="stop a running stream")
+    cancel_cmd.set_defaults(func=cancel)
 
     speakers_cmd = sub.add_parser("speakers", help="list the built-in speakers")
     speakers_cmd.add_argument("--device", default=os.environ.get("TALK_XTTS_DEVICE") or None)

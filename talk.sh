@@ -30,6 +30,7 @@
 #   TALK_XTTS_SPEED        overrides TALK_RATE for xtts; 1.0 is normal
 #   TALK_XTTS_IDLE         default 900   seconds idle before the model unloads
 #   TALK_XTTS_PYTHON       python of the xtts venv
+#   TALK_STREAM            default 1; 0 waits for the whole file before playing
 #   TALK_RATE           default +18%      e.g. +40% faster, -10% slower
 #   TALK_PITCH          default +0Hz      (edge only)
 #   TALK_MAXLEN         default 6000      chars before truncating
@@ -61,7 +62,11 @@ if [[ -z "$XTTS_SERVER" ]]; then
   done
 fi
 
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+STREAM="${TALK_STREAM:-1}"
 STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/claude-talk"
+STREAMDIR="$STATE_DIR/stream"
+READYDIR="$STATE_DIR/ready"
 PIDFILE="$STATE_DIR/play.pid"
 AUDIO="$STATE_DIR/speech.mp3"
 PLAYWAV="$STATE_DIR/play.wav"
@@ -98,25 +103,153 @@ esac
 
 stop_playback() {
   if [[ -f "$PIDFILE" ]]; then
-    local pid; pid=$(<"$PIDFILE")
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    local pid
+    while read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -- "-$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null
+    done < "$PIDFILE"
     rm -f "$PIDFILE"
+  fi
+  # A stream keeps rendering on the GPU after the sound is cut, so tell the
+  # daemon to drop it rather than leaving it to finish into a dead directory.
+  if [[ "${1:-}" != "--keep-stream" ]] && xtts_ready; then
+    "$XTTS_PYTHON" "$XTTS_SERVER" cancel >/dev/null 2>&1
   fi
   # Anchored on the player binary so this can never match the shell running it.
   local p
   for p in ffplay mpv paplay pw-play afplay aplay mpg123; do
-    pkill -f "^([^ ]*/)?$p .*claude-talk/(speech|play)\." 2>/dev/null
+    pkill -f "^([^ ]*/)?$p .*claude-talk" 2>/dev/null
   done
   # WSL interop shows the Windows player as "/init /mnt/c/.../powershell.exe ..."
-  pkill -f "^(/init )?([^ ]*/)?powershell\.exe .*claude-talk\.wav" 2>/dev/null
+  pkill -f "^(/init )?([^ ]*/)?powershell\.exe .*claude-talk" 2>/dev/null
   return 0
+}
+
+# --- streaming playback ----------------------------------------------------
+# The daemon drops finished chunks into a directory as NNN.wav and writes END
+# after the last one. A feeder converts each chunk to the sink's format and a
+# single long lived player walks the sequence, so there is no process start
+# between chunks and no gap the ear can hear.
+stream_feed() {
+  local src="$1" dst="$2" rate="$3" ch="$4" i=0 f out
+  while :; do
+    f=$(printf '%s/%03d.wav' "$src" "$i")
+    if [[ -f "$f" ]]; then
+      out=$(printf '%s/%03d' "$dst" "$i")
+      ffmpeg -y -loglevel error -i "$f" \
+        -af "aresample=resampler=soxr:precision=28:osf=s16" \
+        -ar "$rate" -ac "$ch" -c:a pcm_s16le -f wav "$out.part" 2>/dev/null \
+        && mv -f "$out.part" "$out.wav"
+      i=$((i + 1))
+    elif [[ -f "$src/END" ]]; then
+      : > "$dst/END"
+      return 0
+    else
+      sleep 0.05
+    fi
+  done
+}
+
+stream_play_seq() {
+  local dir="$1" player="$2" i=0 f
+  export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
+  while :; do
+    f=$(printf '%s/%03d.wav' "$dir" "$i")
+    if [[ -f "$f" ]]; then
+      "$player" "$f" >/dev/null 2>&1
+      i=$((i + 1))
+    elif [[ -f "$dir/END" ]]; then
+      return 0
+    else
+      sleep 0.05
+    fi
+  done
+}
+
+stream_play_windows() {
+  powershell.exe -NoProfile -Command "
+\$dir = '$1'
+\$i = 0
+while (\$true) {
+  \$f = Join-Path \$dir ('{0:D3}.wav' -f \$i)
+  if (Test-Path \$f) { (New-Object Media.SoundPlayer \$f).PlaySync(); \$i++ }
+  elseif (Test-Path (Join-Path \$dir 'END')) { break }
+  else { Start-Sleep -Milliseconds 50 }
+}" >/dev/null 2>&1
+}
+
+# Asking Windows for its temp directory costs a third of a second and the
+# answer never changes, so it is cached for the life of the runtime directory.
+win_tmp() {
+  local cache="$STATE_DIR/wintmp" answer
+  if [[ -s "$cache" ]]; then cat "$cache"; return 0; fi
+  answer=$(powershell.exe -NoProfile -Command '$env:TEMP' 2>/dev/null | tr -d '\r')
+  [[ -n "$answer" ]] || return 1
+  printf '%s' "$answer" > "$cache"
+  printf '%s' "$answer"
+}
+
+clear_dir() {
+  mkdir -p "$1" || return 1
+  rm -f "$1"/*.wav "$1"/*.part "$1/END" 2>/dev/null
+  return 0
+}
+
+sink_format() {
+  local spec rate ch
+  spec=$(pactl info 2>/dev/null | sed -n 's/^Default Sample Specification:[[:space:]]*//p')
+  rate=$(grep -oE '[0-9]+Hz' <<<"$spec" | tr -d 'Hz')
+  ch=$(grep -oE '[0-9]+ch' <<<"$spec" | tr -d 'ch')
+  printf '%s %s' "${rate:-48000}" "${ch:-2}"
+}
+
+stream_start_pulse() {
+  local rate ch player
+  have ffmpeg || return 1
+  if   have pw-play; then player=pw-play
+  elif have paplay;  then player=paplay
+  else return 1
+  fi
+  read -r rate ch < <(sink_format)
+  clear_dir "$READYDIR" || return 1
+  bg bash "$SELF" --stream-feed "$STREAMDIR" "$READYDIR" "$rate" "$ch"
+  bg bash "$SELF" --stream-play-seq "$READYDIR" "$player"
+}
+
+stream_start_windows() {
+  local windir lindir
+  have ffmpeg && have wslpath || return 1
+  windir=$(win_tmp) || return 1
+  lindir="$(wslpath -u "$windir")/claude-talk-stream"
+  clear_dir "$lindir" || return 1
+  bg bash "$SELF" --stream-feed "$STREAMDIR" "$lindir" 48000 1
+  bg bash "$SELF" --stream-play-windows "$windir\\claude-talk-stream"
+}
+
+stream_start_macos() {
+  have afplay || return 1
+  bg bash "$SELF" --stream-play-seq "$STREAMDIR" afplay
+}
+
+stream_start() {
+  case "$PLAYER" in
+    windows) stream_start_windows; return $? ;;
+    macos)   stream_start_macos;   return $? ;;
+    linux)   stream_start_pulse;   return $? ;;
+  esac
+  case "$PLATFORM" in
+    macos) stream_start_macos && return 0 ;;
+    wsl)   stream_start_windows && return 0 ;;
+  esac
+  stream_start_pulse
 }
 
 doctor() {
   local engine; engine=$(active_engine)
   echo "platform:   $PLATFORM"
   echo "player:     $PLAYER"
-  echo "engine:     $ENGINE -> $engine"
+  echo "engine:     $ENGINE -> $engine   streaming: $STREAM"
   echo "rate:       $RATE   pitch: $PITCH   maxlen: $MAXLEN"
   echo
   echo "edge voice: $VOICE"
@@ -169,6 +302,15 @@ find_transcript() {
   f=$(ls -t "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null | head -1)
   [[ -n "$f" ]] && printf '%s' "$f"
 }
+
+# Internal entry points. The streaming loops run as detached background jobs,
+# and re-entering this same file keeps them in one place instead of a second
+# installed script.
+case "${1:-}" in
+  --stream-feed)          shift; stream_feed "$@";          exit $? ;;
+  --stream-play-seq)      shift; stream_play_seq "$@";      exit $? ;;
+  --stream-play-windows)  shift; stream_play_windows "$@";  exit $? ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -293,7 +435,17 @@ PY
 if [[ "$PRINT_ONLY" -eq 1 ]]; then printf '%s\n' "$TEXT"; exit 0; fi
 
 announce() { echo "Speaking $(wc -w <<<"$TEXT" | tr -d ' ') words as ${VOICE_USED} via ${ENGINE_USED}. (/talk stop to interrupt)"; }
-bg() { nohup "$@" >/dev/null 2>&1 & echo $! > "$PIDFILE"; disown 2>/dev/null; }
+# Each background job gets its own process group, so stopping playback can
+# take down a loop together with the ffmpeg or player it is currently running.
+bg() {
+  if have setsid; then
+    setsid nohup "$@" >/dev/null 2>&1 &
+  else
+    nohup "$@" >/dev/null 2>&1 &
+  fi
+  echo $! >> "$PIDFILE"
+  disown 2>/dev/null
+}
 
 # --- offline fallback ------------------------------------------------------
 # edge-tts is a network service. If it is unreachable, use a local voice so
@@ -356,6 +508,39 @@ synth_xtts() {
   return 0
 }
 
+# Streaming hands the first chunk to the player while the rest still render.
+# Synthesis runs about twice as fast as speech plays, so the player never
+# starves, and the wait drops from the whole answer to one short sentence.
+synth_xtts_stream() {
+  [[ "$STREAM" == 1 ]] || return 1
+  xtts_ready || return 1
+  local speed voice
+  speed="${XTTS_SPEED:-$(rate_to_speed)}"
+  voice="${VOICE_OVERRIDE:-$XTTS_VOICE}"
+  local args=(stream --text-file "$SPEAKFILE" --outdir "$STREAMDIR"
+              --language "$XTTS_LANG" --speed "$speed")
+  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
+    args+=(--speaker-wav "$XTTS_SPEAKER_WAV")
+  else
+    args+=(--speaker "$voice")
+  fi
+  printf '%s' "$TEXT" > "$SPEAKFILE" || return 1
+  timeout "${TALK_XTTS_TIMEOUT:-900}" "$XTTS_PYTHON" "$XTTS_SERVER" "${args[@]}" \
+    >/dev/null 2>"$ERRLOG" || return 1
+  [[ -f "$STREAMDIR/000.wav" ]] || return 1
+  if ! stream_start; then
+    "$XTTS_PYTHON" "$XTTS_SERVER" cancel >/dev/null 2>&1
+    return 1
+  fi
+  ENGINE_USED="XTTS-v2, streaming"
+  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
+    VOICE_USED="$(basename "$XTTS_SPEAKER_WAV")"
+  else
+    VOICE_USED="$voice"
+  fi
+  return 0
+}
+
 synth_edge() {
   have edge-tts || return 1
   AUDIO="$STATE_DIR/speech.mp3"
@@ -376,6 +561,8 @@ synthesis_failed() {
 stop_playback
 rm -f "$STATE_DIR/speech.mp3" "$STATE_DIR/speech.wav" "$PLAYWAV"
 : > "$ERRLOG"
+
+[[ "$ENGINE" == edge ]] || { synth_xtts_stream && { announce; exit 0; }; }
 
 case "$ENGINE" in
   xtts)
