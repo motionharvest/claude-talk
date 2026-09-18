@@ -38,7 +38,16 @@ for name, text in CASES.items():
     if kept != source:
         failures.append(f"{name}: text changed, {len(source)} in and {len(kept)} out")
 
+argv = module.daemon_command("/tmp/probe.sock", "cuda")[2:]
+parsed = module.build_parser().parse_args(argv)
+if parsed.mode != "serve":
+    failures.append(f"daemon argv: mode is {parsed.mode!r} rather than 'serve'")
+if parsed.socket != "/tmp/probe.sock":
+    failures.append(f"daemon argv: socket is {parsed.socket!r}")
+if parsed.device != "cuda":
+    failures.append(f"daemon argv: device is {parsed.device!r}")
+
 for failure in failures:
     print(f"FAIL {failure}", file=sys.stderr)
-print(f"{len(CASES) - len({f.split(':')[0] for f in failures})} of {len(CASES)} cases clean")
+print(f"{len(CASES)} chunker cases and the daemon argv checked")
 sys.exit(1 if failures else 0)

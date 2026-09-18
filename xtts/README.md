@@ -22,6 +22,16 @@ XTTS-v2 truncates any input longer than roughly 250 characters for English. A ty
 
 Speaker conditioning is computed once per speaker and cached, so the per-chunk cost is inference alone.
 
+## Dependency constraints
+
+Three pins in `install-xtts.sh` are not optional, and each one fails in a way that does not name its own cause.
+
+**`transformers>=4.57,<5`.** `coqui-tts` 0.27.5 asks for `transformers>=4.57` with no upper bound, and `transformers` 5 removed `isin_mps_friendly`, which `coqui-tts` still imports. An unpinned install therefore resolves to 5.x and dies on `ImportError` at the first `TTS` import. The pin goes in the same `pip install` as `coqui-tts` so the solver picks 4.x directly instead of installing 5 and downgrading.
+
+**The torch index follows the driver.** A torch wheel built for a newer CUDA than the installed driver supports imports without complaint and then fails inside `torch.cuda.init()`. The installer reads the CUDA version `nvidia-smi` reports and chooses `cu130`, `cu128`, `cu126` or the CPU index to match. A driver older than CUDA 12.6 gets the CPU build and a warning.
+
+**torchcodec comes from the CPU index.** From torch 2.9, `coqui-tts` refuses to import without `torchcodec`. Its CUDA build links `libnppicc`, which torch does not preload, so it raises `OSError` on load even when the library is installed. Nothing here decodes video, and audio decoding is identical in the CPU build, so that is the one to install. It sits alongside a CUDA torch without trouble.
+
 ## Using it directly
 
 ```bash
@@ -64,6 +74,14 @@ That runs 22 checks and needs neither the virtualenv nor the checkpoint. It buil
 
 ## What is verified
 
-Verified by `./test-dispatch.sh` on this working copy, on Linux 6.18 under WSL2 with Python 3.12.3: all 22 checks pass. They cover engine dispatch, the rate-to-speed conversion and its clamps, voice and language overrides, reference-clip forwarding, voice listing, warm-up, the doctor report, and the error path when XTTS is requested but absent. `split_text` produces no chunk over the limit, no empty chunk, and loses no non-whitespace character.
+`./test-dispatch.sh` passes all 22 checks at this commit. They cover engine dispatch, the rate-to-speed conversion and its clamps, voice and language overrides, reference-clip forwarding, voice listing, warm-up, the doctor report, the daemon argv, and the error path when XTTS is requested but absent. `split_text` produces no chunk over the limit, no empty chunk, and loses no non-whitespace character.
 
-Not verified here: synthesis through the real model, audio quality, and load or inference timings. Those need the checkpoint, which the installer downloads only after you accept the license. The author's expectation, untested, is that a CUDA GPU synthesizes faster than real time and a CPU does not.
+Synthesis is verified against the real checkpoint on one machine: an RTX 4060 Laptop GPU with driver 572.70, Linux 6.18 under WSL2, Python 3.11.15, torch 2.11.0+cu128, `transformers` 4.57.6, `coqui-tts` 0.27.5. The daemon loads on CUDA, `/talk` speaks, and the 58 built-in speakers list. Measured there:
+
+| | |
+|---|---|
+| cold request, model load included | 22 s |
+| warm request, 10.4 s of audio out | 4.6 s |
+| `/talk` end to end, daemon already warm | 2.6 s |
+
+Not verified: any other GPU, any CPU-only host, any language other than English, and voice cloning from a reference clip.

@@ -420,12 +420,22 @@ def talk(sock: Path, payload: dict, timeout: float = REQUEST_TIMEOUT) -> dict:
     return json.loads(line.decode("utf-8"))
 
 
+def daemon_command(socket_path: str, device: str | None = None) -> list[str]:
+    """Return the argv that starts the daemon.
+
+    The socket is a top level option and has to precede the subcommand, while
+    the device belongs to the subcommand and has to follow it.
+    """
+    command = [sys.executable, os.path.abspath(__file__), "--socket", str(socket_path), "serve"]
+    if device:
+        command += ["--device", device]
+    return command
+
+
 def spawn(args) -> None:
     """Start the daemon as a detached background process."""
     log = open(state_dir() / "xtts.log", "ab")
-    command = [sys.executable, os.path.abspath(__file__), "serve", "--socket", str(args.socket)]
-    if args.device:
-        command += ["--device", args.device]
+    command = daemon_command(args.socket, args.device)
     subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,

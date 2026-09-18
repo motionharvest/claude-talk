@@ -33,13 +33,39 @@ have python3 || { bad "python3"; exit 1; }
 PYVER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 ok "python3 $PYVER"
 
+CPU_INDEX="https://download.pytorch.org/whl/cpu"
+
+# A torch wheel built for a newer CUDA than the driver supports imports fine and
+# then fails at torch.cuda.init(), so pick the index from the driver's own
+# reported CUDA version rather than trusting the default wheel.
+torch_index() {
+  local reported major minor
+  reported=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+  [[ -n "$reported" ]] || return 1
+  major=${reported%%.*}
+  minor=${reported##*.}
+  if   (( major >= 13 ));                then printf 'https://download.pytorch.org/whl/cu130'
+  elif (( major == 12 && minor >= 8 )); then printf 'https://download.pytorch.org/whl/cu128'
+  elif (( major == 12 && minor >= 6 )); then printf 'https://download.pytorch.org/whl/cu126'
+  else return 1
+  fi
+}
+
 DEVICE=cpu
+TORCH_INDEX="$CPU_INDEX"
 if have nvidia-smi && nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1; then
-  DEVICE=cuda
   ok "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+  if resolved=$(torch_index); then
+    DEVICE=cuda
+    TORCH_INDEX="$resolved"
+    ok "driver supports CUDA $(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
+  else
+    warn "the driver is older than CUDA 12.6 — falling back to CPU; update the GPU driver for speed"
+  fi
 else
-  warn "no GPU detected — XTTS-v2 on CPU is several times slower than real time"
+  warn "no GPU detected — XTTS-v2 on CPU is slower than real time"
 fi
+[[ -n "${TALK_TORCH_INDEX:-}" ]] && TORCH_INDEX="$TALK_TORCH_INDEX"
 
 if have ffmpeg; then ok "ffmpeg"; else warn "ffmpeg missing — playback quality suffers"; fi
 
@@ -69,8 +95,8 @@ echo
 echo "${bold}Building the environment${rst}  ${dim}$VENV${rst}"
 mkdir -p "$DATA"
 if have uv; then
-  uv venv --python python3 "$VENV" >/dev/null
-  ok "venv created with uv"
+  uv venv --python "${TALK_XTTS_PYVER:-3.11}" "$VENV" >/dev/null
+  ok "venv created with uv on python ${TALK_XTTS_PYVER:-3.11}"
   PIP=(uv pip install --python "$VENV/bin/python" --quiet)
 else
   python3 -m venv "$VENV"
@@ -79,19 +105,42 @@ else
   PIP=("$VENV/bin/python" -m pip install --quiet)
 fi
 
-echo "  installing torch — this downloads a few gigabytes"
-if [[ -n "${TALK_TORCH_INDEX:-}" ]]; then
-  "${PIP[@]}" --index-url "$TALK_TORCH_INDEX" torch torchaudio
-elif [[ "$DEVICE" == cpu ]]; then
-  "${PIP[@]}" --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-else
-  "${PIP[@]}" torch torchaudio
-fi
+echo "  installing torch from $TORCH_INDEX — this downloads a few gigabytes"
+"${PIP[@]}" --index-url "$TORCH_INDEX" torch torchaudio
 ok "torch"
 
+# coqui-tts asks for transformers>=4.57 with no upper bound, and transformers 5
+# dropped isin_mps_friendly, which coqui-tts still imports. Resolve both in one
+# call so the solver picks a 4.x release instead of installing 5 and downgrading.
 echo "  installing coqui-tts"
-"${PIP[@]}" "coqui-tts>=0.26.0"
+"${PIP[@]}" "coqui-tts>=0.26.0" "transformers>=4.57,<5"
 ok "coqui-tts"
+
+# From torch 2.9 coqui-tts refuses to import without torchcodec. Its CUDA build
+# links libnppicc, which torch does not preload, so the CPU build is the one
+# that works; nothing here decodes video and audio decoding is unaffected.
+echo "  installing torchcodec"
+"${PIP[@]}" --index-url "$CPU_INDEX" torchcodec
+ok "torchcodec"
+
+echo
+echo "${bold}Checking the environment${rst}"
+"$VENV/bin/python" - "$DEVICE" <<'PY'
+import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+import torch
+from TTS.tts.models.xtts import Xtts  # noqa: F401
+
+print(f"  torch {torch.__version__}")
+if sys.argv[1] == "cuda":
+    if torch.cuda.is_available():
+        print(f"  cuda ready on {torch.cuda.get_device_name(0)}")
+    else:
+        print("  WARNING: torch cannot reach the GPU; speech will run on the CPU")
+print("  coqui-tts imports")
+PY
 
 echo
 echo "${bold}Downloading XTTS-v2${rst}  ${dim}about 2G, once${rst}"
