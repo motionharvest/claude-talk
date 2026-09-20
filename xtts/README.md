@@ -24,6 +24,8 @@ So the server no longer returns a finished file. `stream` renders chunk by chunk
 
 The opening chunk is capped at 120 characters rather than the usual 220, because nothing is heard until it is done. Later chunks keep the full size, which is more efficient per second of audio.
 
+The opening chunk also has a floor of 110 characters, and the floor wins when the two disagree. Without it a short opening sentence produces a tiny chunk, playback starts almost at once, and then the listener waits mid-answer while the next chunk renders. The floor comes from the timing: a full chunk takes about 4.7 seconds to render on the measured hardware, speech runs about 0.045 seconds per character, so the opening chunk needs roughly 105 characters of speech to cover it. Every chunk after the first is covered by a buffer that only grows, because synthesis outruns playback.
+
 On the playback side `talk.sh` runs two background loops. A feeder converts each chunk to the sound server's exact format and drops it in a ready directory. A single long-lived player walks the sequence, waiting when it gets ahead and stopping at `END`. One player process for the whole answer means no process start between chunks and no gap the ear can hear.
 
 Synthesis runs roughly twice as fast as speech plays, so the player stays fed after the first chunk. If it ever does not, the audible result is a pause rather than a failure.
@@ -32,7 +34,11 @@ Synthesis runs roughly twice as fast as speech plays, so the player stays fed af
 
 ## Why the text is split
 
-XTTS-v2 truncates any input longer than roughly 250 characters for English. A typical Claude answer is far longer than that, so the server splits the text before synthesis. Splitting happens at sentence boundaries first, at word boundaries only when one sentence is itself too long, and mid-word only when one word is too long. The resulting audio is concatenated with 80 ms of silence between chunks. `split_text` preserves every non-whitespace character of the input, which is checked in the tests below.
+XTTS-v2 truncates any input longer than roughly 250 characters for English. A typical Claude answer is far longer than that, so the server splits the text before synthesis.
+
+Splitting is layered, and each layer is a fallback for the one above. Whole sentences come first, cut at a full stop, question mark, exclamation mark or line break. A sentence too long to render in one pass falls back to clause breaks at a semicolon, colon or comma. A clause still too long falls back to word breaks, and a single word longer than the limit is cut mid-word. In ordinary prose only the first layer is ever used, so a chunk boundary is always a sentence boundary. That matters for streaming: any pause between chunks then lands where a pause sounds like punctuation rather than a fault.
+
+The non-streaming path joins the audio with 80 ms of silence between chunks. `split_text` preserves every non-whitespace character of the input, which is checked in the tests below.
 
 Speaker conditioning is computed once per speaker and cached, so the per-chunk cost is inference alone.
 
@@ -95,11 +101,13 @@ Synthesis is verified against the real checkpoint on one machine: an RTX 4060 La
 | | |
 |---|---|
 | cold `/talk`, model load included | 20.0 s |
-| warm `/talk`, 292-word answer | 1.7 s |
-| warm `/talk`, one-sentence answer | 1.0 s |
+| warm `/talk`, 347-word answer | 3.7 to 3.9 s |
+| warm `/talk`, one-sentence answer | 1.1 s |
 | warm `/talk` issued right after `/talk stop` | 5.7 to 8.7 s |
-| full synthesis of that 292-word answer | 32.8 s |
+| full synthesis of a 292-word answer | 32.8 s |
 
-The last row is what streaming removed from the wait. Before streaming, the same answer took 32.8 seconds to reach the first word on a warm daemon.
+The last row is what streaming removed from the wait. Before streaming, an answer of that length took 32.8 seconds to reach the first word on a warm daemon.
+
+Chunk delivery was traced against playback demand for the 347-word answer. Every chunk arrived before the player needed it. The smallest margin was 0.30 seconds on the first handoff and it grew to 48.85 seconds by the last chunk, so the buffer builds rather than drains.
 
 Not verified: any other GPU, any CPU-only host, any language other than English, and voice cloning from a reference clip.

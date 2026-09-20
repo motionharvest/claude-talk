@@ -36,11 +36,13 @@ DEFAULT_LANGUAGE = "en"
 SAMPLE_RATE = 24000
 CHUNK_LIMIT = 220
 FIRST_CHUNK_LIMIT = 120
+FIRST_CHUNK_MIN = 110
 STREAM_FIRST_TIMEOUT = 300.0
 GAP_SECONDS = 0.08
 START_TIMEOUT = 60.0
 REQUEST_TIMEOUT = 900.0
-_BOUNDARY = re.compile(r"(?<=[.!?;:])\s+|\n+")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+_CLAUSE = re.compile(r"(?<=[;:,])\s+")
 
 
 def state_dir() -> Path:
@@ -101,35 +103,59 @@ def _wrap(piece: str, limit: int) -> list[str]:
 
 
 def _pieces(text: str, limit: int) -> list[str]:
-    """Return the atomic pieces of text, none longer than limit."""
+    """Return the atomic pieces of text, none longer than limit.
+
+    Whole sentences come first. A sentence too long to synthesize in one pass
+    falls back to clause breaks, and a clause still too long falls back to word
+    breaks. Every chunk is built from these pieces, so a chunk ends mid sentence
+    only when one sentence on its own exceeds the limit.
+    """
     out: list[str] = []
-    for part in (p.strip() for p in _BOUNDARY.split(text)):
-        if not part:
+    for sentence in (p.strip() for p in _SENTENCE.split(text)):
+        if not sentence:
             continue
-        out.extend(_wrap(part, limit) if len(part) > limit else [part])
+        if len(sentence) <= limit:
+            out.append(sentence)
+            continue
+        for clause in (c.strip() for c in _CLAUSE.split(sentence)):
+            if not clause:
+                continue
+            out.extend(_wrap(clause, limit) if len(clause) > limit else [clause])
     return out
 
 
 def split_text(
-    text: str, limit: int = CHUNK_LIMIT, first_limit: int | None = None
+    text: str,
+    limit: int = CHUNK_LIMIT,
+    first_limit: int | None = None,
+    first_min: int | None = None,
 ) -> list[str]:
     """Split text into chunks XTTS-v2 can synthesize in one pass.
 
     XTTS-v2 truncates any input over roughly 250 characters, so the caller must
-    never hand it a whole response. Splitting happens at sentence boundaries
-    first and at word boundaries only when one sentence is itself too long.
+    never hand it a whole response.
 
-    A first_limit shortens the opening chunk only. Streaming playback waits on
-    that chunk before any sound starts, so a short one reaches the ear sooner
-    while the rest keep the full size that makes synthesis efficient.
+    A first_limit shortens the opening chunk, because streaming playback waits
+    on it before any sound starts. A first_min stops it from being too short to
+    be useful: the opening chunk has to hold at least as much speech as the next
+    chunk takes to synthesize, or the player runs dry and the listener hears a
+    gap. On the measured hardware a full chunk needs about 4.7 seconds to render
+    and speech runs about 0.045 seconds per character, which puts that floor at
+    roughly 105 characters. The floor wins over the cap when they disagree.
     """
     chunks: list[str] = []
     current = ""
     for piece in _pieces(text, limit):
-        cap = first_limit if (first_limit and not chunks) else limit
         if not current:
             current = piece
-        elif len(current) + 1 + len(piece) <= cap:
+            continue
+        if chunks:
+            cap = limit
+        elif first_min and len(current) < first_min:
+            cap = limit
+        else:
+            cap = first_limit or limit
+        if len(current) + 1 + len(piece) <= cap:
             current = f"{current} {piece}"
         else:
             chunks.append(current)
@@ -358,7 +384,7 @@ class Engine:
                     return
                 self.load()
                 gpt, embedding = self.conditioning(speaker, speaker_wav)
-                chunks = split_text(text, CHUNK_LIMIT, first_limit)
+                chunks = split_text(text, CHUNK_LIMIT, first_limit, FIRST_CHUNK_MIN)
                 if not chunks:
                     raise RuntimeError("nothing to speak")
                 box["chunks"] = len(chunks)

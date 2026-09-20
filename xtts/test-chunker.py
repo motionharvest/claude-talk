@@ -38,6 +38,29 @@ for name, text in CASES.items():
     if kept != source:
         failures.append(f"{name}: text changed, {len(source)} in and {len(kept)} out")
 
+PROSE = (
+    "Streaming is live. A warm call now reaches the first word in about two "
+    "seconds instead of thirty three, whatever the answer length. The daemon no "
+    "longer returns a finished file. It renders chunk by chunk into a directory "
+    "and returns as soon as the first chunk lands. Each chunk is written under a "
+    "temporary name and renamed into place. An end marker tells the player when "
+    "to stop."
+)
+prose_chunks = module.split_text(PROSE, LIMIT, 120, 110)
+ragged = [c for c in prose_chunks if c.rstrip()[-1:] not in ".!?"]
+if ragged:
+    failures.append(f"sentence ends: {len(ragged)} chunk(s) end mid-sentence")
+if len(prose_chunks[0]) < 110:
+    failures.append(f"first chunk floor: opening chunk is {len(prose_chunks[0])} chars")
+
+long_sentence = "This clause runs on and on, " * 12 + "and then it finally stops."
+if any(len(c) > LIMIT for c in module.split_text(long_sentence, LIMIT)):
+    failures.append("clause fallback: a chunk exceeded the limit")
+
+no_floor = module.split_text(PROSE, LIMIT, 120)
+if len(no_floor[0]) >= 110:
+    failures.append("without a floor the opening chunk should stay short")
+
 argv = module.daemon_command("/tmp/probe.sock", "cuda")[2:]
 parsed = module.build_parser().parse_args(argv)
 if parsed.mode != "serve":
@@ -49,5 +72,5 @@ if parsed.device != "cuda":
 
 for failure in failures:
     print(f"FAIL {failure}", file=sys.stderr)
-print(f"{len(CASES)} chunker cases and the daemon argv checked")
+print(f"{len(CASES)} chunker cases, sentence ends, the first chunk floor and the daemon argv checked")
 sys.exit(1 if failures else 0)
