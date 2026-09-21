@@ -109,28 +109,41 @@ fi
 # --- google api key --------------------------------------------------------
 # Read straight into the key file. Typing it at a prompt keeps it out of shell
 # history, out of the process list, and out of this script's arguments.
-echo
-if [[ -s "$KEY_FILE" ]]; then
-  ok "Google API key already at $KEY_FILE"
-elif [[ -t 0 ]]; then
-  echo "${bold}Google Cloud Text-to-Speech${rst} ${dim}(optional — edge-tts works without it)${rst}"
-  echo "  Enable the API and make a key at ${dim}https://console.cloud.google.com/apis/credentials${rst}"
-  echo "  Leave blank to skip."
-  printf '  API key: '
-  read -rs GOOGLE_KEY || GOOGLE_KEY=""
+ask_for_key() {
+  printf '  API key (leave blank to skip): '
+  local key=""
+  read -rs key || key=""
   echo
-  if [[ -n "$GOOGLE_KEY" ]]; then
-    mkdir -p "$CONFIG_DIR"
-    (umask 077; printf '%s' "$GOOGLE_KEY" > "$KEY_FILE")
-    unset GOOGLE_KEY
-    if "$DEST/talk.sh" --check-key; then
-      ok "$KEY_FILE"
-    else
-      warn "saved to $KEY_FILE anyway — fix it there, or delete the file"
-    fi
+  [[ -n "$key" ]] || return 1
+  mkdir -p "$CONFIG_DIR"
+  (umask 077; printf '%s' "$key" > "$KEY_FILE")
+  key=""
+  if "$DEST/talk.sh" --check-key; then
+    ok "$KEY_FILE"
+  else
+    warn "saved to $KEY_FILE anyway — fix it there, or delete the file"
   fi
+}
+
+echo
+echo "${bold}Google Cloud Text-to-Speech${rst} ${dim}(optional — edge-tts works without it)${rst}"
+if [[ -s "$KEY_FILE" ]]; then
+  # A key file that was already here has never been checked by anything, and a
+  # key that silently doesn't work looks exactly like no key at all.
+  chmod 600 "$KEY_FILE" 2>/dev/null || true
+  if "$DEST/talk.sh" --check-key; then
+    ok "$KEY_FILE"
+  elif [[ -t 0 ]]; then
+    warn "the key at $KEY_FILE does not work — enter a new one to replace it"
+    ask_for_key || true
+  else
+    warn "the key at $KEY_FILE does not work — replace it or delete the file"
+  fi
+elif [[ -t 0 ]]; then
+  echo "  Make a key at ${dim}https://console.cloud.google.com/apis/credentials${rst}"
+  echo "  ${dim}Billing and the Cloud Text-to-Speech API both have to be on — see the README.${rst}"
+  ask_for_key || true
 else
-  echo "${bold}Google Cloud Text-to-Speech${rst} ${dim}(optional)${rst}"
   echo "  ${dim}mkdir -p $CONFIG_DIR${rst}"
   echo "  ${dim}printf '%s' 'YOUR_KEY' > $KEY_FILE && chmod 600 $KEY_FILE${rst}"
 fi

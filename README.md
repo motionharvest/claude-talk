@@ -26,15 +26,21 @@ Or clone and run `./install.sh`. Both drop two files into `~/.claude/`:
 ~/.claude/commands/talk.md   the slash command
 ```
 
-The installer offers to take a Google API key and writes it to `~/.config/claude-talk/google-api-key` with `600` permissions. Skip it and `/talk` uses `edge-tts` instead.
+The installer offers to take a Google API key and writes it to `~/.config/claude-talk/google-api-key` with `600` permissions. If you don't have one yet, [make one first](#getting-a-google-api-key) — or skip the prompt and `/talk` uses `edge-tts` instead, which needs no key at all. You can add the key later without reinstalling.
 
 Start a new session and `/talk` is available. To remove it, run `./uninstall.sh`.
 
-### Google Cloud Text-to-Speech
+### Getting a Google API key
 
-Create a project in the [Google Cloud console](https://console.cloud.google.com), enable the **Cloud Text-to-Speech API** on it, then make an API key under *APIs & Services → Credentials*. The key is what `/talk` needs; there is no OAuth flow and no service account file.
+The Google engine needs an API key: one string, about 39 characters, starting `AIzaSy`. There is no OAuth flow, no service account JSON and no `gcloud` install. Making one takes a few minutes in the browser.
 
-If you skipped the installer prompt:
+1. Sign in to the [Google Cloud console](https://console.cloud.google.com) and create a project, or pick one you already have. The project is what the key belongs to and what usage is billed against.
+2. [Enable billing](https://console.cloud.google.com/billing) on that project. Text-to-Speech refuses to run without a billing account attached, even entirely inside the free allowance — this is the step that catches most people. Attaching one does not start charges; those begin only past the free monthly characters.
+3. Enable the [Cloud Text-to-Speech API](https://console.cloud.google.com/apis/library/texttospeech.googleapis.com) on the project, from that link or by searching its name in the console. Give it a minute to take effect.
+4. Open [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials), choose **Create credentials → API key**, and copy the string.
+5. Restrict the key before you close the dialog. Edit it, set **API restrictions** to *Restrict key*, and pick **Cloud Text-to-Speech API**. An unrestricted key works against every API enabled on the project, which is worth avoiding for a string that then sits in a file on your laptop.
+
+Hand the key to `/talk` by re-running `./install.sh`, which prompts for it without echoing it and writes the file for you. Or write the file yourself:
 
 ```bash
 mkdir -p ~/.config/claude-talk
@@ -42,7 +48,9 @@ printf '%s' 'YOUR_KEY' > ~/.config/claude-talk/google-api-key
 chmod 600 ~/.config/claude-talk/google-api-key
 ```
 
-`/talk --check-key` confirms the key works and reports how many voices it can reach. `/talk --list-voices` names them all — several hundred, across most languages, in tiers that sound and cost differently. The default is `en-US-Neural2-F`; set another with `TALK_GOOGLE_VOICE`.
+Either way, `/talk --check-key` confirms it works and reports how many voices it can reach. If it does, you're done — `/talk` will use Google from the next invocation.
+
+`/talk --list-voices` names every voice the key can reach: several hundred, across most languages, in tiers that sound and cost differently. The default is `en-US-Neural2-F`; set another with `TALK_GOOGLE_VOICE`.
 
 The key is never passed as a command line argument, so it never appears in `ps` output or in your shell history. `talk.sh` doesn't read it either — it hands the path to the synthesis client, which is the only process that sees the contents.
 
@@ -132,7 +140,7 @@ If you're using some other TTS setup on WSL and hearing the same grit, this is v
 
 **Nothing plays.** Check `--doctor` found a player. On Linux, `sudo apt install ffmpeg pulseaudio-utils` covers it.
 
-**"API key not valid".** The key is wrong, or the Cloud Text-to-Speech API isn't enabled on the project the key belongs to. Enabling it takes a minute to propagate. `/talk --check-key` tests it on its own.
+**The key is refused.** Google's reply names the step you missed, and `/talk --check-key` prints it without synthesizing anything. *"API key not valid. Please pass a valid API key."* means the string itself is wrong — look for a truncated copy or a stray newline in the file. A message about the API not having been used in a project, or being disabled, means step 3 hasn't taken effect; it names the project, which is worth reading if you have several. A message about billing means step 2. A message about requests to this API being blocked means the key's restrictions exclude Text-to-Speech, which is step 5 applied too narrowly.
 
 **Crackling on WSL.** Should be handled automatically. If it persists, `TALK_PLAYER=linux /talk` uses the PulseAudio route instead, and `TALK_LATENCY_MSEC=400` gives it a bigger buffer.
 
