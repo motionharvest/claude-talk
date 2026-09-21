@@ -1,5 +1,6 @@
 ---
 description: Speak the last response aloud
+argument-hint: "[pause | resume | restart | stop]"
 allowed-tools: Bash(~/.claude/talk.sh:*)
 ---
 

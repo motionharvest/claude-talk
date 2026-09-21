@@ -4,7 +4,10 @@
 #
 # Usage:
 #   talk.sh                 speak the last response
-#   talk.sh stop            stop playback
+#   talk.sh pause           pause playback where it is
+#   talk.sh resume          continue from where pause or stop left off
+#   talk.sh restart         play the same response again from the beginning
+#   talk.sh stop            stop playback; resume still works afterwards
 #   talk.sh --print         print what would be spoken, don't speak
 #   talk.sh --engine NAME   auto | google | edge
 #   talk.sh --voice NAME    use a different voice for this run
@@ -81,6 +84,10 @@ STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/claude-talk"
 STREAMDIR="$STATE_DIR/stream"
 READYDIR="$STATE_DIR/ready"
 PIDFILE="$STATE_DIR/play.pid"
+PLAYERPID="$STATE_DIR/player.pid"
+POSFILE="$STATE_DIR/pos"
+RESUMEFILE="$STATE_DIR/resume"
+SESSIONFILE="$STATE_DIR/session"
 AUDIO="$STATE_DIR/speech.mp3"
 PLAYWAV="$STATE_DIR/play.wav"
 SPEAKFILE="$STATE_DIR/speak.txt"
@@ -125,16 +132,19 @@ case "$(uname -s)" in
   *)      PLATFORM=linux ;;
 esac
 
-stop_playback() {
-  if [[ -f "$PIDFILE" ]]; then
-    local pid
-    while read -r pid; do
-      [[ -n "$pid" ]] || continue
-      kill -- "-$pid" 2>/dev/null
-      kill "$pid" 2>/dev/null
-    done < "$PIDFILE"
-    rm -f "$PIDFILE"
-  fi
+kill_pids() {
+  local f="$1" pid
+  [[ -f "$f" ]] || return 0
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -- "-$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null
+  done < "$f"
+  rm -f "$f"
+  return 0
+}
+
+kill_players() {
   # Anchored on the player binary so this can never match the shell running it.
   local p
   for p in ffplay mpv paplay pw-play afplay aplay mpg123; do
@@ -143,6 +153,75 @@ stop_playback() {
   # WSL interop shows the Windows player as "/init /mnt/c/.../powershell.exe ..."
   pkill -f "^(/init )?([^ ]*/)?powershell\.exe .*claude-talk" 2>/dev/null
   return 0
+}
+
+halt_player() {
+  kill_pids "$PLAYERPID"
+  kill_players
+  return 0
+}
+
+stop_playback() {
+  halt_player
+  kill_pids "$PIDFILE"
+  return 0
+}
+
+playing() {
+  local pid
+  [[ -f "$PLAYERPID" ]] || return 1
+  while read -r pid; do
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  done < "$PLAYERPID"
+  return 1
+}
+
+# Each background job gets its own process group, so stopping playback can
+# take down a loop together with the ffmpeg or player it is currently running.
+bg() {
+  if have setsid; then
+    setsid nohup "$@" >/dev/null 2>>"$ERRLOG" &
+  else
+    nohup "$@" >/dev/null 2>>"$ERRLOG" &
+  fi
+  BG_PID=$!
+  echo "$BG_PID" >> "$PIDFILE"
+  disown 2>/dev/null
+}
+
+bg_player() {
+  bg "$@"
+  echo "$BG_PID" >> "$PLAYERPID"
+}
+
+save_session() {
+  local kv
+  : > "$SESSIONFILE"
+  for kv in "$@"; do printf '%s\n' "$kv" >> "$SESSIONFILE"; done
+}
+
+load_session() {
+  [[ -s "$SESSIONFILE" ]] || return 1
+  S_ROUTE=""; S_DIR=""; S_WINDIR=""; S_PLAYER=""; S_EXT=""; S_AUDIO=""; S_POS=""
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      route)  S_ROUTE="$v" ;;
+      dir)    S_DIR="$v" ;;
+      windir) S_WINDIR="$v" ;;
+      player) S_PLAYER="$v" ;;
+      ext)    S_EXT="$v" ;;
+      audio)  S_AUDIO="$v" ;;
+      pos)    S_POS="$v" ;;
+    esac
+  done < "$SESSIONFILE"
+  [[ -n "$S_ROUTE" ]]
+}
+
+mark_position() {
+  local idx="$1" offset="${2:-0}" file="$3"
+  [[ -n "$file" ]] || return 0
+  printf '%s %s\n' "$idx" "$(( $(date +%s) - offset ))" > "$file"
 }
 
 # --- streaming playback ----------------------------------------------------
@@ -171,11 +250,18 @@ stream_feed() {
 }
 
 stream_play_seq() {
-  local dir="$1" player="$2" ext="${3:-wav}" i=0 f
+  local dir="$1" player="$2" ext="${3:-wav}" posf="${4:-}" i="${5:-0}" offset="${6:-0}" f head
   export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
+  head="$dir/resume.$ext"
+  if [[ -f "$head" ]]; then
+    mark_position "$(( i > 0 ? i - 1 : 0 ))" "$offset" "$posf"
+    "$player" "$head" >/dev/null 2>&1
+    rm -f "$head"
+  fi
   while :; do
     f=$(printf '%s/%03d.%s' "$dir" "$i" "$ext")
     if [[ -f "$f" ]]; then
+      mark_position "$i" 0 "$posf"
       "$player" "$f" >/dev/null 2>&1
       i=$((i + 1))
     elif [[ -f "$dir/END" || -f "$dir/ERR" ]]; then
@@ -189,10 +275,22 @@ stream_play_seq() {
 stream_play_windows() {
   powershell.exe -NoProfile -Command "
 \$dir = '$1'
-\$i = 0
+\$i = ${2:-0}
+\$offset = ${3:-0}
+\$pos = Join-Path \$dir 'pos'
+\$head = Join-Path \$dir 'resume.wav'
+function Mark([int]\$n, [int]\$back) {
+  \$t = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - \$back
+  Set-Content -Path \$pos -Value (\$n.ToString() + ' ' + \$t.ToString())
+}
+if (Test-Path \$head) {
+  Mark ([Math]::Max(\$i - 1, 0)) \$offset
+  (New-Object Media.SoundPlayer \$head).PlaySync()
+  Remove-Item \$head -ErrorAction SilentlyContinue
+}
 while (\$true) {
   \$f = Join-Path \$dir ('{0:D3}.wav' -f \$i)
-  if (Test-Path \$f) { (New-Object Media.SoundPlayer \$f).PlaySync(); \$i++ }
+  if (Test-Path \$f) { Mark \$i 0; (New-Object Media.SoundPlayer \$f).PlaySync(); \$i++ }
   elseif (Test-Path (Join-Path \$dir 'END')) { break }
   else { Start-Sleep -Milliseconds 50 }
 }" >/dev/null 2>&1
@@ -211,7 +309,7 @@ win_tmp() {
 
 clear_dir() {
   mkdir -p "$1" || return 1
-  rm -f "$1"/*.wav "$1"/*.mp3 "$1"/*.part "$1/END" "$1/ERR" 2>/dev/null
+  rm -f "$1"/*.wav "$1"/*.mp3 "$1"/*.part "$1/END" "$1/ERR" "$1/pos" 2>/dev/null
   return 0
 }
 
@@ -232,8 +330,9 @@ stream_start_pulse() {
   fi
   read -r rate ch < <(sink_format)
   clear_dir "$READYDIR" || return 1
+  save_session route=seq "dir=$READYDIR" "player=$player" ext=wav "pos=$POSFILE"
   bg bash "$SELF" --stream-feed "$STREAMDIR" "$READYDIR" "$rate" "$ch" "$STREAM_EXT"
-  bg bash "$SELF" --stream-play-seq "$READYDIR" "$player" wav
+  bg_player bash "$SELF" --stream-play-seq "$READYDIR" "$player" wav "$POSFILE" 0 0
 }
 
 stream_start_windows() {
@@ -242,15 +341,17 @@ stream_start_windows() {
   windir=$(win_tmp) || return 1
   lindir="$(wslpath -u "$windir")/claude-talk-stream"
   clear_dir "$lindir" || return 1
+  save_session route=windows "dir=$lindir" "windir=$windir\\claude-talk-stream" ext=wav "pos=$lindir/pos"
   bg bash "$SELF" --stream-feed "$STREAMDIR" "$lindir" 48000 1 "$STREAM_EXT"
-  bg bash "$SELF" --stream-play-windows "$windir\\claude-talk-stream"
+  bg_player bash "$SELF" --stream-play-windows "$windir\\claude-talk-stream" 0 0
 }
 
 # afplay decodes mp3 itself, so the macOS route plays the chunks as they land
 # and never needs ffmpeg at all.
 stream_start_macos() {
   have afplay || return 1
-  bg bash "$SELF" --stream-play-seq "$STREAMDIR" afplay "$STREAM_EXT"
+  save_session route=seq "dir=$STREAMDIR" player=afplay "ext=$STREAM_EXT" "pos=$POSFILE"
+  bg_player bash "$SELF" --stream-play-seq "$STREAMDIR" afplay "$STREAM_EXT" "$POSFILE" 0 0
 }
 
 stream_start() {
@@ -264,6 +365,185 @@ stream_start() {
     wsl)   stream_start_windows && return 0 ;;
   esac
   stream_start_pulse
+}
+
+# --- playback --------------------------------------------------------------
+# On WSL the Linux sink is WSLg's RDPSink, which streams audio to Windows over
+# RDP with no buffer headroom: it starves mid-playback and crackles regardless
+# of how the stream is formatted. Handing the file to Windows removes that path
+# entirely. TALK_PLAYER=linux forces the PulseAudio route.
+play_windows() {
+  have powershell.exe && have wslpath && have ffmpeg || return 1
+  local wintmp lintmp
+  wintmp=$(win_tmp) || return 1
+  lintmp=$(wslpath -u "$wintmp" 2>/dev/null) && [[ -d "$lintmp" ]] || return 1
+  # SoundPlayer needs PCM WAV; 48 kHz is what the Windows mixer runs natively
+  ffmpeg -y -loglevel error -i "$AUDIO" \
+    -af "aresample=resampler=soxr:precision=28:osf=s16" \
+    -ar 48000 -ac 1 -c:a pcm_s16le "$lintmp/claude-talk.wav" 2>>"$ERRLOG" || return 1
+  bg_player powershell.exe -NoProfile -Command \
+    '(New-Object Media.SoundPlayer "$env:TEMP\claude-talk.wav").PlaySync()'
+}
+
+# macOS CoreAudio plays mp3 natively and never needed any of this.
+play_macos() { have afplay && bg_player afplay "$AUDIO"; }
+
+# Match the sink's exact format so the sound server resamples nothing — a
+# cheap inline resampler on a non-integer ratio is a classic source of clicks.
+play_linux() {
+  local rate ch
+  read -r rate ch < <(sink_format)
+
+  if have ffmpeg && { have paplay || have pw-play; }; then
+    if ffmpeg -y -loglevel error -i "$AUDIO" \
+         -af "aresample=resampler=soxr:precision=28:osf=s16" \
+         -ar "$rate" -ac "$ch" -c:a pcm_s16le "$PLAYWAV" 2>>"$ERRLOG"; then
+      export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
+      have pw-play && { bg_player pw-play "$PLAYWAV"; return 0; }
+      bg_player paplay "$PLAYWAV"; return 0
+    fi
+  fi
+  have mpv    && { bg_player mpv --no-video --really-quiet "$AUDIO"; return 0; }
+  have ffplay && { bg_player ffplay -nodisp -autoexit -loglevel quiet "$AUDIO"; return 0; }
+  [[ "$AUDIO" == *.mp3 ]] && have mpg123 && { bg_player mpg123 -q "$AUDIO"; return 0; }
+  return 1
+}
+
+play_file() {
+  local offset="${1:-0}"
+  mark_position 0 "$offset" "$POSFILE"
+  case "$PLAYER" in
+    windows) play_windows && return 0 ;;
+    macos)   play_macos   && return 0 ;;
+    linux)   play_linux   && return 0 ;;
+    auto)
+      case "$PLATFORM" in
+        macos) play_macos   && return 0 ;;
+        wsl)   play_windows && return 0 ;;
+      esac
+      play_linux && return 0 ;;
+  esac
+  return 1
+}
+
+media_seconds() {
+  have ffprobe || return 1
+  local d
+  d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null)
+  [[ -n "$d" && "$d" != N/A ]] || return 1
+  printf '%s' "${d%%.*}"
+}
+
+seek_head() {
+  local src="$1" dst="$2" offset="$3" ext="$4" size fmt
+  have ffmpeg || return 1
+  case "$ext" in
+    wav) fmt=wav ;;
+    ogg) fmt=ogg ;;
+    *)   fmt=mp3 ;;
+  esac
+  case "$ext" in
+    wav) ffmpeg -y -loglevel error -ss "$offset" -i "$src" -c:a pcm_s16le -f "$fmt" "$dst.part" 2>>"$ERRLOG" || return 1 ;;
+    *)   ffmpeg -y -loglevel error -ss "$offset" -i "$src" -c copy -f "$fmt" "$dst.part" 2>>"$ERRLOG" || return 1 ;;
+  esac
+  size=$(stat -c%s "$dst.part" 2>/dev/null || stat -f%z "$dst.part" 2>/dev/null)
+  if [[ -z "$size" ]] || (( size < 1024 )); then rm -f "$dst.part"; return 1; fi
+  mv -f "$dst.part" "$dst"
+}
+
+start_playback() {
+  local idx="$1" offset="$2" src head dur
+  load_session || { echo "talk: nothing has been spoken yet — run /talk first" >&2; return 1; }
+  halt_player
+
+  case "$S_ROUTE" in
+    seq|windows)
+      src=$(printf '%s/%03d.%s' "$S_DIR" "$idx" "$S_EXT")
+      [[ -f "$src" ]] || { idx=0; offset=0; src=$(printf '%s/000.%s' "$S_DIR" "$S_EXT"); }
+      [[ -f "$src" ]] || { echo "talk: the audio for that response is gone — run /talk again" >&2; return 1; }
+      dur=$(media_seconds "$src") || dur=""
+      if (( offset > 0 )) && [[ -n "$dur" ]] && (( offset >= dur )); then
+        offset=0
+        idx=$((idx + 1))
+        [[ -f "$(printf '%s/%03d.%s' "$S_DIR" "$idx" "$S_EXT")" ]] \
+          || { echo "talk: that response finished playing — /talk restart plays it again" >&2; return 1; }
+      fi
+      head="$S_DIR/resume.$S_EXT"
+      rm -f "$head"
+      if (( offset > 0 )) && seek_head "$src" "$head" "$offset" "$S_EXT"; then
+        idx=$((idx + 1))
+      else
+        offset=0
+      fi
+      if [[ "$S_ROUTE" == windows ]]; then
+        bg_player bash "$SELF" --stream-play-windows "$S_WINDIR" "$idx" "$offset"
+      else
+        bg_player bash "$SELF" --stream-play-seq "$S_DIR" "$S_PLAYER" "$S_EXT" "$S_POS" "$idx" "$offset"
+      fi
+      ;;
+    single)
+      [[ -s "$S_AUDIO" ]] || { echo "talk: the audio for that response is gone — run /talk again" >&2; return 1; }
+      dur=$(media_seconds "$S_AUDIO") || dur=""
+      if (( offset > 0 )) && [[ -n "$dur" ]] && (( offset >= dur )); then
+        echo "talk: that response finished playing — /talk restart plays it again" >&2; return 1
+      fi
+      AUDIO="$S_AUDIO"
+      if (( offset > 0 )) && seek_head "$S_AUDIO" "$STATE_DIR/resume.mp3" "$offset" mp3; then
+        AUDIO="$STATE_DIR/resume.mp3"
+      else
+        offset=0
+      fi
+      play_file "$offset" || { echo "talk: no working audio player found — run 'talk.sh --doctor'" >&2; return 1; }
+      ;;
+    *)
+      echo "talk: nothing has been spoken yet — run /talk first" >&2; return 1 ;;
+  esac
+  return 0
+}
+
+halt_and_mark() {
+  local word="$1" idx=0 start="" now off
+  local live=1
+  playing || live=0
+  if load_session && [[ -s "$S_POS" ]]; then
+    read -r idx start < <(tr -d '\r' < "$S_POS")
+  fi
+  halt_player
+  if (( live == 0 )); then
+    if [[ -s "$RESUMEFILE" ]]; then
+      echo "Already paused. (/talk resume to continue)"
+    else
+      echo "Nothing is playing."
+    fi
+    return 0
+  fi
+  now=$(date +%s)
+  idx="${idx:-0}"
+  start="${start:-$now}"
+  off=$(( now - start ))
+  (( off < 0 )) && off=0
+  printf '%s %s\n' "$idx" "$off" > "$RESUMEFILE"
+  case "$word" in
+    pause) echo "Paused. (/talk resume to continue)" ;;
+    *)     echo "Playback stopped. (/talk resume to continue)" ;;
+  esac
+}
+
+talk_resume() {
+  local idx off
+  [[ -s "$RESUMEFILE" ]] || { echo "talk: nothing is paused — run /talk to speak the last response" >&2; exit 1; }
+  read -r idx off < "$RESUMEFILE"
+  off="${off:-0}"
+  (( off > 1 )) && off=$((off - 1)) || off=0
+  start_playback "${idx:-0}" "$off" || exit 1
+  rm -f "$RESUMEFILE"
+  echo "Resumed. (/talk pause to interrupt)"
+}
+
+talk_restart() {
+  start_playback 0 0 || exit 1
+  rm -f "$RESUMEFILE"
+  echo "Restarted from the beginning. (/talk pause to interrupt)"
 }
 
 doctor() {
@@ -661,7 +941,10 @@ esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    stop|--stop)   stop_playback; echo "Playback stopped."; exit 0 ;;
+    stop|--stop)       halt_and_mark stop;  exit 0 ;;
+    pause|--pause)     halt_and_mark pause; exit 0 ;;
+    resume|--resume)   talk_resume;         exit 0 ;;
+    restart|--restart) talk_restart;        exit 0 ;;
     --print)       PRINT_ONLY=1; shift ;;
     --engine)      ENGINE="${2:-$ENGINE}"; shift 2 ;;
     --voice)       VOICE_OVERRIDE="${2:-}"; VOICE="${2:-$VOICE}"; shift 2 ;;
@@ -727,14 +1010,29 @@ TRANSCRIPT=$(find_transcript)
 # but no tool calls. Walking backwards and stopping at the first message with a
 # tool_use skips the "let me check X" progress lines emitted between tools.
 RAW=$(jq -rs '
+  def talknoise:
+    (. // "") | sub("^\\s+"; "")
+    | test("^Speaking [0-9]+ words? / [0-9]+ characters? as .* to interrupt\\)")
+      or test("^Playback stopped\\.")
+      or test("^Paused\\.")
+      or test("^Resumed\\.")
+      or test("^Restarted from the beginning\\.")
+      or test("^Already paused\\.")
+      or test("^Nothing is playing\\.")
+      or test("^talk: ")
+      or test("The command above already ran and its output is shown\\.");
   [ .[]
     | select((.isSidechain // false) | not)
     | if .type == "assistant" then
         { a: true,
           tool: (([ .message.content[]? | select(.type == "tool_use") ] | length) > 0),
           txt:  ([ .message.content[]? | select(.type == "text") | .text ] | join("\n\n")) }
-      elif .type == "user" then { a: false, tool: false, txt: "" }
+      elif .type == "user" then
+        { a: false, tool: false,
+          txt: (if (.message.content | type) == "string" then .message.content
+                else ([ .message.content[]? | select(.type == "text") | .text ] | join("\n\n")) end) }
       else empty end
+    | select((.txt | talknoise) | not)
   ]
   | reverse as $rev
   | ( reduce $rev[] as $x ({ stop: false, acc: [] };
@@ -794,19 +1092,7 @@ announce() {
   local words chars
   words=$(wc -w <<<"$TEXT" | tr -d ' ')
   chars=${#TEXT}
-  echo "Speaking $words words / $chars characters as ${VOICE_USED} via ${ENGINE_USED}. (/talk stop to interrupt)"
-}
-
-# Each background job gets its own process group, so stopping playback can
-# take down a loop together with the ffmpeg or player it is currently running.
-bg() {
-  if have setsid; then
-    setsid nohup "$@" >/dev/null 2>>"$ERRLOG" &
-  else
-    nohup "$@" >/dev/null 2>>"$ERRLOG" &
-  fi
-  echo $! >> "$PIDFILE"
-  disown 2>/dev/null
+  echo "Speaking $words words / $chars characters as ${VOICE_USED} via ${ENGINE_USED}. (/talk pause to interrupt)"
 }
 
 # --- offline fallback ------------------------------------------------------
@@ -895,7 +1181,8 @@ synthesis_failed() {
 }
 
 stop_playback
-rm -f "$STATE_DIR/speech.mp3" "$STATE_DIR/speech.wav" "$PLAYWAV"
+rm -f "$STATE_DIR/speech.mp3" "$STATE_DIR/speech.wav" "$PLAYWAV" \
+      "$RESUMEFILE" "$POSFILE" "$SESSIONFILE" "$STATE_DIR/resume.mp3"
 : > "$ERRLOG"
 
 case "$(active_engine)" in
@@ -909,59 +1196,8 @@ case "$(active_engine)" in
     synth_edge || { speak_offline && exit 0; synthesis_failed; } ;;
 esac
 
-# --- playback --------------------------------------------------------------
-# On WSL the Linux sink is WSLg's RDPSink, which streams audio to Windows over
-# RDP with no buffer headroom: it starves mid-playback and crackles regardless
-# of how the stream is formatted. Handing the file to Windows removes that path
-# entirely. TALK_PLAYER=linux forces the PulseAudio route.
-play_windows() {
-  have powershell.exe && have wslpath && have ffmpeg || return 1
-  local wintmp lintmp
-  wintmp=$(win_tmp) || return 1
-  lintmp=$(wslpath -u "$wintmp" 2>/dev/null) && [[ -d "$lintmp" ]] || return 1
-  # SoundPlayer needs PCM WAV; 48 kHz is what the Windows mixer runs natively
-  ffmpeg -y -loglevel error -i "$AUDIO" \
-    -af "aresample=resampler=soxr:precision=28:osf=s16" \
-    -ar 48000 -ac 1 -c:a pcm_s16le "$lintmp/claude-talk.wav" 2>>"$ERRLOG" || return 1
-  bg powershell.exe -NoProfile -Command \
-    '(New-Object Media.SoundPlayer "$env:TEMP\claude-talk.wav").PlaySync()'
-}
-
-# macOS CoreAudio plays mp3 natively and never needed any of this.
-play_macos() { have afplay && bg afplay "$AUDIO"; }
-
-# Match the sink's exact format so the sound server resamples nothing — a
-# cheap inline resampler on a non-integer ratio is a classic source of clicks.
-play_linux() {
-  local rate ch
-  read -r rate ch < <(sink_format)
-
-  if have ffmpeg && { have paplay || have pw-play; }; then
-    if ffmpeg -y -loglevel error -i "$AUDIO" \
-         -af "aresample=resampler=soxr:precision=28:osf=s16" \
-         -ar "$rate" -ac "$ch" -c:a pcm_s16le "$PLAYWAV" 2>>"$ERRLOG"; then
-      export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
-      have pw-play && { bg pw-play "$PLAYWAV"; return 0; }
-      bg paplay "$PLAYWAV"; return 0
-    fi
-  fi
-  have mpv    && { bg mpv --no-video --really-quiet "$AUDIO"; return 0; }
-  have ffplay && { bg ffplay -nodisp -autoexit -loglevel quiet "$AUDIO"; return 0; }
-  [[ "$AUDIO" == *.mp3 ]] && have mpg123 && { bg mpg123 -q "$AUDIO"; return 0; }
-  return 1
-}
-
-case "$PLAYER" in
-  windows) play_windows && { announce; exit 0; } ;;
-  macos)   play_macos   && { announce; exit 0; } ;;
-  linux)   play_linux   && { announce; exit 0; } ;;
-  auto)
-    case "$PLATFORM" in
-      macos) play_macos   && { announce; exit 0; } ;;
-      wsl)   play_windows && { announce; exit 0; } ;;
-    esac
-    play_linux && { announce; exit 0; } ;;
-esac
+save_session route=single "audio=$AUDIO" "pos=$POSFILE"
+play_file 0 && { announce; exit 0; }
 
 echo "talk: no working audio player found — run 'talk.sh --doctor'" >&2
 exit 1

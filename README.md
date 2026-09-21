@@ -6,7 +6,10 @@ Like `/copy`, but for your ears. Useful when you want to keep reading code while
 
 ```
 /talk              speak the last response
-/talk stop         stop playback
+/talk pause        pause where it is
+/talk resume       continue from the pause point
+/talk restart      play the same response again from the beginning
+/talk stop         stop playback; resume still works afterwards
 /talk --print      print what would be spoken, don't speak
 /talk --doctor     check your audio setup
 ```
@@ -118,11 +121,21 @@ Claude Code writes each session to `~/.claude/projects/<project>/<session-id>.js
 
 Getting *the last response* right takes a little care. A turn's transcript isn't one message — it's interleaved with the "let me check X" lines Claude emits between tool calls. So the script walks backwards from the end and stops at the first message containing a `tool_use`, which leaves exactly the final answer.
 
+`/talk` also has to skip its own footprints. Running it adds two entries to the transcript — the command turn and Claude's one-line echo of the "Speaking N words" notice — and without that both `/talk` twice in a row and `/talk` after `/talk stop` would read the notice back to you instead of the answer. The walk treats those entries as if they were not there.
+
 The text then goes through a markdown-to-prose pass, because code fences and tables are miserable to listen to: fenced code becomes "Code block omitted", links collapse to their text, and headings, bullets, emphasis and emoji are stripped.
 
 What reaches Google is a small Python client that `talk.sh` writes into its runtime directory at speak time. It does the sentence splitting, the parallel HTTP and the base64 decode in one process, and it is the only thing that ever holds the API key. Nothing is installed for it and there is no daemon to warm up.
 
 The slash command uses Claude Code's `` !`...` `` syntax, so the script runs at expansion time rather than as a tool call. No model round-trip, no risk of Claude narrating over it.
+
+### Pausing and replaying
+
+Being interrupted is the normal case, so halting playback never throws the audio away. `/talk pause` and `/talk stop` both record which chunk was playing and how far into it, and `/talk resume` picks up from a second before that point. `/talk restart` plays the same response again from the beginning.
+
+None of this re-synthesizes anything. The audio is already on disk — streaming leaves it there as numbered chunks — so resuming is a matter of starting the player at a different file, with the partial chunk trimmed by `ffmpeg`. Nothing is billed a second time, and it works offline.
+
+Pausing also leaves synthesis running. If you pause four seconds into a long answer, the rest keeps arriving in the background and is waiting for you when you resume.
 
 ## Notes on audio quality
 
