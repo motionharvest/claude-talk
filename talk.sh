@@ -35,6 +35,7 @@
 #   TALK_GOOGLE_LANG       default: the voice name's own language
 #   TALK_GOOGLE_SPEED      overrides TALK_RATE for google; 1.0 is normal
 #   TALK_GOOGLE_PITCH      default 0        semitones, -20 to 20
+#   TALK_GOOGLE_GAIN       default 0        volume in dB, -96 to 16
 #   TALK_GOOGLE_PROFILE    audio effects profile, e.g. headphone-class-device
 #   TALK_GOOGLE_JOBS       default 4        parallel synthesis requests
 #   TALK_GOOGLE_ENCODING   default MP3      MP3 | OGG_OPUS | LINEAR16
@@ -62,6 +63,7 @@ GOOGLE_KEY_FILE="${TALK_GOOGLE_KEY_FILE:-$CONFIG_DIR/google-api-key}"
 GOOGLE_LANG="${TALK_GOOGLE_LANG:-}"
 GOOGLE_SPEED="${TALK_GOOGLE_SPEED:-}"
 GOOGLE_PITCH="${TALK_GOOGLE_PITCH:-0}"
+GOOGLE_GAIN="${TALK_GOOGLE_GAIN:-0}"
 GOOGLE_PROFILE="${TALK_GOOGLE_PROFILE:-}"
 GOOGLE_JOBS="${TALK_GOOGLE_JOBS:-4}"
 GOOGLE_ENCODING="${TALK_GOOGLE_ENCODING:-MP3}"
@@ -393,6 +395,7 @@ VOICE = setting("TALK_GOOGLE_VOICE", "en-US-Neural2-F")
 LANGUAGE = setting("TALK_GOOGLE_LANG") or "-".join(VOICE.split("-")[:2])
 SPEED = min(max(number("TALK_GOOGLE_SPEED", 1.0), 0.25), 4.0)
 PITCH = min(max(number("TALK_GOOGLE_PITCH", 0.0), -20.0), 20.0)
+GAIN = min(max(number("TALK_GOOGLE_GAIN", 0.0), -96.0), 16.0)
 PROFILE = setting("TALK_GOOGLE_PROFILE")
 ENCODING = setting("TALK_GOOGLE_ENCODING", "MP3")
 EXTENSION = setting("TALK_GOOGLE_EXT", "mp3")
@@ -499,6 +502,7 @@ def audio_config() -> dict:
     if _prosody:
         config["speakingRate"] = SPEED
         config["pitch"] = PITCH
+        config["volumeGainDb"] = GAIN
     if PROFILE:
         config["effectsProfileId"] = [PROFILE]
     return config
@@ -518,7 +522,9 @@ def synthesize(text: str) -> bytes:
         except urllib.error.HTTPError as error:
             text_of_error = message_of(error)
             lowered = text_of_error.lower()
-            if _prosody and error.code == 400 and ("pitch" in lowered or "rate" in lowered):
+            if _prosody and error.code == 400 and any(
+                word in lowered for word in ("pitch", "rate", "volume")
+            ):
                 _prosody = False
                 continue
             if error.code in RETRY_CODES and attempt < RETRIES:
@@ -628,6 +634,7 @@ google_env() {
   export TALK_GOOGLE_LANG="$GOOGLE_LANG"
   export TALK_GOOGLE_SPEED="${GOOGLE_SPEED:-$(rate_to_speed)}"
   export TALK_GOOGLE_PITCH="$GOOGLE_PITCH"
+  export TALK_GOOGLE_GAIN="$GOOGLE_GAIN"
   export TALK_GOOGLE_PROFILE="$GOOGLE_PROFILE"
   export TALK_GOOGLE_JOBS="$GOOGLE_JOBS"
   export TALK_GOOGLE_ENCODING="$GOOGLE_ENCODING"

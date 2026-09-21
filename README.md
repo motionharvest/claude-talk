@@ -48,7 +48,7 @@ The key is never passed as a command line argument, so it never appears in `ps` 
 
 **Billing.** Google bills per character synthesized, at a rate that depends on the voice tier, and gives a free monthly allowance per tier. Both are on the [pricing page](https://cloud.google.com/text-to-speech/pricing); check it before you point this at long answers. `/talk` prints the character count it sent every time it speaks, and `TALK_MAXLEN` caps how much of an answer it will read at all.
 
-**Voices that refuse speed and pitch.** Some tiers — Chirp and Studio among them — reject `speakingRate` and `pitch`. `/talk` doesn't try to predict which: it sends them, and if the API rejects them it drops both and re-sends, for the rest of that run. So `TALK_GOOGLE_VOICE=en-US-Chirp3-HD-Aoede` works, it just ignores `TALK_RATE`.
+**Voices that refuse speed and pitch.** Some tiers — Chirp and Studio among them — reject `speakingRate`, `pitch` and `volumeGainDb`. `/talk` doesn't try to predict which: it sends all three, and if the API rejects them it drops all three and re-sends, for the rest of that run. So `TALK_GOOGLE_VOICE=en-US-Chirp3-HD-Aoede` works, it just ignores `TALK_RATE`.
 
 ### Streaming
 
@@ -86,6 +86,7 @@ TALK_GOOGLE_KEY_FILE=~/keys/gcp     # default ~/.config/claude-talk/google-api-k
 TALK_GOOGLE_LANG=en-GB              # default: the language in the voice name
 TALK_GOOGLE_SPEED=1.2               # overrides TALK_RATE for google
 TALK_GOOGLE_PITCH=-2                # semitones, -20 to 20; default 0
+TALK_GOOGLE_GAIN=-3                 # volume in dB, -96 to 16; default 0
 TALK_GOOGLE_JOBS=4                  # parallel synthesis requests
 TALK_GOOGLE_ENCODING=MP3            # MP3 | OGG_OPUS | LINEAR16
 TALK_GOOGLE_FIRST_CHUNK=180         # chars in the opening chunk
