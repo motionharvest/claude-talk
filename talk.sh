@@ -6,30 +6,42 @@
 #   talk.sh                 speak the last response
 #   talk.sh stop            stop playback
 #   talk.sh --print         print what would be spoken, don't speak
-#   talk.sh --engine NAME   auto | xtts | edge
+#   talk.sh --engine NAME   auto | google | edge
 #   talk.sh --voice NAME    use a different voice for this run
-#   talk.sh --speaker FILE  clone the voice in a wav clip (xtts only)
-#   talk.sh --lang CODE     language of the text (xtts only, default en)
+#   talk.sh --lang CODE     language code for this run (google only)
 #   talk.sh --rate +30%     speed up / slow down for this run
-#   talk.sh --warm          load the xtts model now, before you need it
+#   talk.sh --key-file F    read the Google API key from F for this run
 #   talk.sh --list-voices   list available voices
+#   talk.sh --check-key     verify the Google API key works
 #   talk.sh --doctor        check dependencies and audio setup
 #
 # Engines:
-#   xtts   XTTS-v2 on this machine. No network, clonable voices, needs a GPU
-#          to run faster than real time. Install it with xtts/install-xtts.sh.
-#   edge   Microsoft's cloud voices through edge-tts. Needs a network.
-#   auto   xtts when it is installed, edge otherwise.
+#   google  Google Cloud Text-to-Speech. Needs an API key and a network.
+#           Streams: the first sentence plays while the rest is still being
+#           synthesized. Billed per character.
+#   edge    Microsoft's cloud voices through edge-tts. Free, no key, no
+#           streaming.
+#   auto    google when an API key is configured, edge otherwise.
+#
+# The Google API key is read from TALK_GOOGLE_KEY, or from a file — by default
+# ~/.config/claude-talk/google-api-key. It is never passed on a command line.
 #
 # Config: environment variables, or ~/.config/claude-talk/config (shell syntax)
 #   TALK_ENGINE            default auto
 #   TALK_VOICE             default en-US-AriaNeural   edge voice name
-#   TALK_XTTS_VOICE        default Claribel Dervla    built-in xtts speaker
-#   TALK_XTTS_SPEAKER_WAV  6-30s wav to clone instead of a built-in speaker
-#   TALK_XTTS_LANG         default en
-#   TALK_XTTS_SPEED        overrides TALK_RATE for xtts; 1.0 is normal
-#   TALK_XTTS_IDLE         default 900   seconds idle before the model unloads
-#   TALK_XTTS_PYTHON       python of the xtts venv
+#   TALK_GOOGLE_VOICE      default en-US-Neural2-F    google voice name
+#   TALK_GOOGLE_KEY        the API key itself
+#   TALK_GOOGLE_KEY_FILE   default ~/.config/claude-talk/google-api-key
+#   TALK_GOOGLE_LANG       default: the voice name's own language
+#   TALK_GOOGLE_SPEED      overrides TALK_RATE for google; 1.0 is normal
+#   TALK_GOOGLE_PITCH      default 0        semitones, -20 to 20
+#   TALK_GOOGLE_PROFILE    audio effects profile, e.g. headphone-class-device
+#   TALK_GOOGLE_JOBS       default 4        parallel synthesis requests
+#   TALK_GOOGLE_ENCODING   default MP3      MP3 | OGG_OPUS | LINEAR16
+#   TALK_GOOGLE_CHUNK      default 700      chars per request after the first
+#   TALK_GOOGLE_FIRST_CHUNK default 180     chars in the opening chunk
+#   TALK_GOOGLE_TIMEOUT    default 60       seconds per synthesis request
+#   TALK_GOOGLE_WAIT       default 60       seconds to wait for the first chunk
 #   TALK_STREAM            default 1; 0 waits for the whole file before playing
 #   TALK_RATE           default +18%      e.g. +40% faster, -10% slower
 #   TALK_PITCH          default +0Hz      (edge only)
@@ -39,28 +51,27 @@
 
 set -uo pipefail
 
-CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claude-talk/config"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-talk"
+CONFIG="$CONFIG_DIR/config"
 [[ -f "$CONFIG" ]] && . "$CONFIG"
 
 ENGINE="${TALK_ENGINE:-auto}"
 VOICE="${TALK_VOICE:-en-US-AriaNeural}"
-XTTS_VOICE="${TALK_XTTS_VOICE:-Claribel Dervla}"
-XTTS_SPEAKER_WAV="${TALK_XTTS_SPEAKER_WAV:-}"
-XTTS_LANG="${TALK_XTTS_LANG:-en}"
-XTTS_SPEED="${TALK_XTTS_SPEED:-}"
+GOOGLE_VOICE="${TALK_GOOGLE_VOICE:-en-US-Neural2-F}"
+GOOGLE_KEY_FILE="${TALK_GOOGLE_KEY_FILE:-$CONFIG_DIR/google-api-key}"
+GOOGLE_LANG="${TALK_GOOGLE_LANG:-}"
+GOOGLE_SPEED="${TALK_GOOGLE_SPEED:-}"
+GOOGLE_PITCH="${TALK_GOOGLE_PITCH:-0}"
+GOOGLE_PROFILE="${TALK_GOOGLE_PROFILE:-}"
+GOOGLE_JOBS="${TALK_GOOGLE_JOBS:-4}"
+GOOGLE_ENCODING="${TALK_GOOGLE_ENCODING:-MP3}"
+GOOGLE_CHUNK="${TALK_GOOGLE_CHUNK:-700}"
+GOOGLE_FIRST_CHUNK="${TALK_GOOGLE_FIRST_CHUNK:-180}"
+GOOGLE_TIMEOUT="${TALK_GOOGLE_TIMEOUT:-60}"
 RATE="${TALK_RATE:-+18%}"
 PITCH="${TALK_PITCH:-+0Hz}"
 MAXLEN="${TALK_MAXLEN:-6000}"
 PLAYER="${TALK_PLAYER:-auto}"
-
-SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-XTTS_PYTHON="${TALK_XTTS_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-talk/venv/bin/python}"
-XTTS_SERVER="${TALK_XTTS_SERVER:-}"
-if [[ -z "$XTTS_SERVER" ]]; then
-  for _c in "$HOME/.claude/talk-xtts.py" "$SELF_DIR/talk-xtts.py" "$SELF_DIR/xtts/xtts_server.py"; do
-    [[ -f "$_c" ]] && { XTTS_SERVER="$_c"; break; }
-  done
-fi
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 STREAM="${TALK_STREAM:-1}"
@@ -71,27 +82,38 @@ PIDFILE="$STATE_DIR/play.pid"
 AUDIO="$STATE_DIR/speech.mp3"
 PLAYWAV="$STATE_DIR/play.wav"
 SPEAKFILE="$STATE_DIR/speak.txt"
+CLIENT="$STATE_DIR/google.py"
 ERRLOG="$STATE_DIR/err.log"
+
+# The chunk file name has to match what the encoder actually produced, because
+# the feeder and the macOS player both find chunks by name.
+case "$GOOGLE_ENCODING" in
+  OGG_OPUS) STREAM_EXT=ogg ;;
+  LINEAR16) STREAM_EXT=wav ;;
+  *)        STREAM_EXT=mp3 ;;
+esac
+
 PRINT_ONLY=0
 VOICE_OVERRIDE=""
 ENGINE_USED=""
 VOICE_USED=""
 DO_DOCTOR=0
 DO_LIST=0
-DO_WARM=0
+DO_CHECK=0
 
 mkdir -p "$STATE_DIR"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# XTTS is usable only when both its virtualenv and its server script are present.
-xtts_ready() { [[ -n "$XTTS_SERVER" && -f "$XTTS_SERVER" && -x "$XTTS_PYTHON" ]]; }
+# The key is never read into a shell variable — only the client process, which
+# needs it to sign the request, ever sees its contents.
+google_ready() { [[ -n "${TALK_GOOGLE_KEY:-}" || -s "$GOOGLE_KEY_FILE" ]]; }
 
 active_engine() {
   case "$ENGINE" in
-    xtts|edge) printf '%s' "$ENGINE" ;;
-    auto)      xtts_ready && printf 'xtts' || printf 'edge' ;;
-    *)         printf 'edge' ;;
+    google|edge) printf '%s' "$ENGINE" ;;
+    auto)        google_ready && printf 'google' || printf 'edge' ;;
+    *)           printf 'edge' ;;
   esac
 }
 
@@ -111,11 +133,6 @@ stop_playback() {
     done < "$PIDFILE"
     rm -f "$PIDFILE"
   fi
-  # A stream keeps rendering on the GPU after the sound is cut, so tell the
-  # daemon to drop it rather than leaving it to finish into a dead directory.
-  if [[ "${1:-}" != "--keep-stream" ]] && xtts_ready; then
-    "$XTTS_PYTHON" "$XTTS_SERVER" cancel >/dev/null 2>&1
-  fi
   # Anchored on the player binary so this can never match the shell running it.
   local p
   for p in ffplay mpv paplay pw-play afplay aplay mpg123; do
@@ -127,14 +144,14 @@ stop_playback() {
 }
 
 # --- streaming playback ----------------------------------------------------
-# The daemon drops finished chunks into a directory as NNN.wav and writes END
-# after the last one. A feeder converts each chunk to the sink's format and a
-# single long lived player walks the sequence, so there is no process start
-# between chunks and no gap the ear can hear.
+# The synthesis client drops finished chunks into a directory as NNN.<ext> and
+# writes END after the last one. A feeder converts each chunk to the sink's
+# format and a single long lived player walks the sequence, so there is no
+# process start between chunks and no gap the ear can hear.
 stream_feed() {
-  local src="$1" dst="$2" rate="$3" ch="$4" i=0 f out
+  local src="$1" dst="$2" rate="$3" ch="$4" ext="$5" i=0 f out
   while :; do
-    f=$(printf '%s/%03d.wav' "$src" "$i")
+    f=$(printf '%s/%03d.%s' "$src" "$i" "$ext")
     if [[ -f "$f" ]]; then
       out=$(printf '%s/%03d' "$dst" "$i")
       ffmpeg -y -loglevel error -i "$f" \
@@ -142,7 +159,7 @@ stream_feed() {
         -ar "$rate" -ac "$ch" -c:a pcm_s16le -f wav "$out.part" 2>/dev/null \
         && mv -f "$out.part" "$out.wav"
       i=$((i + 1))
-    elif [[ -f "$src/END" ]]; then
+    elif [[ -f "$src/END" || -f "$src/ERR" ]]; then
       : > "$dst/END"
       return 0
     else
@@ -152,14 +169,14 @@ stream_feed() {
 }
 
 stream_play_seq() {
-  local dir="$1" player="$2" i=0 f
+  local dir="$1" player="$2" ext="${3:-wav}" i=0 f
   export PULSE_LATENCY_MSEC="${TALK_LATENCY_MSEC:-200}"
   while :; do
-    f=$(printf '%s/%03d.wav' "$dir" "$i")
+    f=$(printf '%s/%03d.%s' "$dir" "$i" "$ext")
     if [[ -f "$f" ]]; then
       "$player" "$f" >/dev/null 2>&1
       i=$((i + 1))
-    elif [[ -f "$dir/END" ]]; then
+    elif [[ -f "$dir/END" || -f "$dir/ERR" ]]; then
       return 0
     else
       sleep 0.05
@@ -192,7 +209,7 @@ win_tmp() {
 
 clear_dir() {
   mkdir -p "$1" || return 1
-  rm -f "$1"/*.wav "$1"/*.part "$1/END" 2>/dev/null
+  rm -f "$1"/*.wav "$1"/*.mp3 "$1"/*.part "$1/END" "$1/ERR" 2>/dev/null
   return 0
 }
 
@@ -213,8 +230,8 @@ stream_start_pulse() {
   fi
   read -r rate ch < <(sink_format)
   clear_dir "$READYDIR" || return 1
-  bg bash "$SELF" --stream-feed "$STREAMDIR" "$READYDIR" "$rate" "$ch"
-  bg bash "$SELF" --stream-play-seq "$READYDIR" "$player"
+  bg bash "$SELF" --stream-feed "$STREAMDIR" "$READYDIR" "$rate" "$ch" "$STREAM_EXT"
+  bg bash "$SELF" --stream-play-seq "$READYDIR" "$player" wav
 }
 
 stream_start_windows() {
@@ -223,13 +240,15 @@ stream_start_windows() {
   windir=$(win_tmp) || return 1
   lindir="$(wslpath -u "$windir")/claude-talk-stream"
   clear_dir "$lindir" || return 1
-  bg bash "$SELF" --stream-feed "$STREAMDIR" "$lindir" 48000 1
+  bg bash "$SELF" --stream-feed "$STREAMDIR" "$lindir" 48000 1 "$STREAM_EXT"
   bg bash "$SELF" --stream-play-windows "$windir\\claude-talk-stream"
 }
 
+# afplay decodes mp3 itself, so the macOS route plays the chunks as they land
+# and never needs ffmpeg at all.
 stream_start_macos() {
   have afplay || return 1
-  bg bash "$SELF" --stream-play-seq "$STREAMDIR" afplay
+  bg bash "$SELF" --stream-play-seq "$STREAMDIR" afplay "$STREAM_EXT"
 }
 
 stream_start() {
@@ -253,21 +272,17 @@ doctor() {
   echo "rate:       $RATE   pitch: $PITCH   maxlen: $MAXLEN"
   echo
   echo "edge voice: $VOICE"
-  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
-    echo "xtts voice: $XTTS_SPEAKER_WAV (cloned)   lang: $XTTS_LANG"
+  echo "gcp voice:  $GOOGLE_VOICE   lang: ${GOOGLE_LANG:-from voice name}"
+  if [[ -n "${TALK_GOOGLE_KEY:-}" ]]; then
+    echo "gcp key:    set in TALK_GOOGLE_KEY"
+  elif [[ -s "$GOOGLE_KEY_FILE" ]]; then
+    echo "gcp key:    $GOOGLE_KEY_FILE ($(stat -c '%a' "$GOOGLE_KEY_FILE" 2>/dev/null || stat -f '%Lp' "$GOOGLE_KEY_FILE" 2>/dev/null))"
   else
-    echo "xtts voice: $XTTS_VOICE   lang: $XTTS_LANG"
+    echo "gcp key:    NOT SET — see README, or set TALK_GOOGLE_KEY"
   fi
-  echo
-  if xtts_ready; then
-    echo "xtts:       installed"
-    echo "  python    $XTTS_PYTHON"
-    echo "  server    $XTTS_SERVER"
-    "$XTTS_PYTHON" "$XTTS_SERVER" status 2>&1 | sed 's/^/  /'
-  else
-    echo "xtts:       NOT installed — run xtts/install-xtts.sh"
-    [[ -n "$XTTS_SERVER" ]] && echo "  server    $XTTS_SERVER"
-    [[ -x "$XTTS_PYTHON" ]] || echo "  python    $XTTS_PYTHON (missing)"
+  if google_ready; then
+    echo -n "gcp status: "
+    google_client check 2>&1 | head -2
   fi
   echo
   for c in jq python3 edge-tts ffmpeg; do
@@ -303,6 +318,331 @@ find_transcript() {
   [[ -n "$f" ]] && printf '%s' "$f"
 }
 
+# --- google cloud text-to-speech client ------------------------------------
+# Written out at run time rather than installed, so /talk stays two files. It
+# does the sentence splitting, the parallel HTTP, and the base64 decode in one
+# process; there is no daemon and nothing to warm up.
+write_google_client() {
+  cat > "$CLIENT.part" <<'PY'
+#!/usr/bin/env python3
+"""Google Cloud Text-to-Speech client for claude-talk.
+
+Modes:
+    stream <outdir>   synthesize into NNN.<ext>, in order, then touch END
+    single <outfile>  synthesize the whole text into one audio file
+    voices            print every voice the key can reach
+    check             verify the key and print the voice count
+
+Everything else arrives in the environment, so the API key is never visible
+in the process list.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+DEFAULT_API = "https://texttospeech.googleapis.com/v1"
+RETRY_CODES = {408, 429, 500, 502, 503, 504}
+RETRIES = 3
+
+# Sentences first, clauses when a sentence is too long, words as a last resort.
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+_CLAUSE = re.compile(r"(?<=[;:,])\s+")
+
+
+class Failure(Exception):
+    """An error worth showing the user verbatim."""
+
+
+def setting(name: str, default: str = "") -> str:
+    return os.environ.get(name, "").strip() or default
+
+
+def number(name: str, default: float) -> float:
+    try:
+        return float(setting(name, str(default)))
+    except ValueError:
+        return default
+
+
+def api_key() -> str:
+    key = os.environ.get("TALK_GOOGLE_KEY", "").strip()
+    if key:
+        return key
+    path = setting("TALK_GOOGLE_KEY_FILE")
+    if path and Path(path).is_file():
+        return Path(path).read_text(encoding="utf-8").strip()
+    raise Failure(
+        "no Google API key — put one in "
+        f"{path or '~/.config/claude-talk/google-api-key'} or set TALK_GOOGLE_KEY"
+    )
+
+
+API = setting("TALK_GOOGLE_API", DEFAULT_API).rstrip("/")
+VOICE = setting("TALK_GOOGLE_VOICE", "en-US-Neural2-F")
+LANGUAGE = setting("TALK_GOOGLE_LANG") or "-".join(VOICE.split("-")[:2])
+SPEED = min(max(number("TALK_GOOGLE_SPEED", 1.0), 0.25), 4.0)
+PITCH = min(max(number("TALK_GOOGLE_PITCH", 0.0), -20.0), 20.0)
+PROFILE = setting("TALK_GOOGLE_PROFILE")
+ENCODING = setting("TALK_GOOGLE_ENCODING", "MP3")
+EXTENSION = setting("TALK_GOOGLE_EXT", "mp3")
+JOBS = max(int(number("TALK_GOOGLE_JOBS", 4)), 1)
+TIMEOUT = number("TALK_GOOGLE_TIMEOUT", 60.0)
+CHUNK_LIMIT = int(number("TALK_GOOGLE_CHUNK", 700))
+FIRST_LIMIT = int(number("TALK_GOOGLE_FIRST_CHUNK", 180))
+
+# Chirp and Studio voices reject speakingRate and pitch. The first rejection
+# turns them off for the rest of the run rather than being predicted from the
+# voice name, which would go stale every time Google ships a tier.
+_prosody = True
+
+
+def _wrap(piece: str, limit: int) -> list[str]:
+    """Break one long run of words into pieces no longer than limit."""
+    out: list[str] = []
+    current = ""
+    for word in piece.split():
+        while len(word) > limit:
+            if current:
+                out.append(current)
+                current = ""
+            out.append(word[:limit])
+            word = word[limit:]
+        if not current:
+            current = word
+        elif len(current) + 1 + len(word) <= limit:
+            current = f"{current} {word}"
+        else:
+            out.append(current)
+            current = word
+    if current:
+        out.append(current)
+    return out
+
+
+def _pieces(text: str, limit: int) -> list[str]:
+    """Return the atomic pieces of text, none longer than limit.
+
+    Whole sentences come first. A sentence too long for one request falls back
+    to clause breaks, and a clause still too long falls back to word breaks. So
+    a chunk ends mid sentence only when one sentence on its own exceeds limit.
+    """
+    out: list[str] = []
+    for sentence in (p.strip() for p in _SENTENCE.split(text)):
+        if not sentence:
+            continue
+        if len(sentence) <= limit:
+            out.append(sentence)
+            continue
+        for clause in (c.strip() for c in _CLAUSE.split(sentence)):
+            if not clause:
+                continue
+            out.extend(_wrap(clause, limit) if len(clause) > limit else [clause])
+    return out
+
+
+def split_text(text: str, limit: int, first_limit: int) -> list[str]:
+    """Split text into chunks, with a shorter opening chunk.
+
+    Streaming playback waits on the first chunk before any sound starts, so it
+    is capped well below the rest. The remaining chunks are synthesized in
+    parallel and land long before the opening one has finished playing, so
+    there is no floor to protect against the player running dry.
+    """
+    chunks: list[str] = []
+    current = ""
+    for piece in _pieces(text, limit):
+        if not current:
+            current = piece
+            continue
+        cap = limit if chunks else first_limit
+        if len(current) + 1 + len(piece) <= cap:
+            current = f"{current} {piece}"
+        else:
+            chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def message_of(error: urllib.error.HTTPError) -> str:
+    try:
+        return json.loads(error.read().decode("utf-8"))["error"]["message"]
+    except Exception:
+        return f"HTTP {error.code}"
+
+
+def call(path: str, body: dict | None = None) -> dict:
+    headers = {"X-Goog-Api-Key": KEY}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(f"{API}/{path}", data=data, headers=headers)
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return json.load(response)
+
+
+def audio_config() -> dict:
+    config = {"audioEncoding": ENCODING}
+    if _prosody:
+        config["speakingRate"] = SPEED
+        config["pitch"] = PITCH
+    if PROFILE:
+        config["effectsProfileId"] = [PROFILE]
+    return config
+
+
+def synthesize(text: str) -> bytes:
+    global _prosody
+    delay = 0.5
+    for attempt in range(RETRIES + 1):
+        body = {
+            "input": {"text": text},
+            "voice": {"languageCode": LANGUAGE, "name": VOICE},
+            "audioConfig": audio_config(),
+        }
+        try:
+            return base64.b64decode(call("text:synthesize", body)["audioContent"])
+        except urllib.error.HTTPError as error:
+            text_of_error = message_of(error)
+            lowered = text_of_error.lower()
+            if _prosody and error.code == 400 and ("pitch" in lowered or "rate" in lowered):
+                _prosody = False
+                continue
+            if error.code in RETRY_CODES and attempt < RETRIES:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise Failure(text_of_error) from None
+        except urllib.error.URLError as error:
+            if attempt < RETRIES:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise Failure(f"could not reach Google Cloud: {error.reason}") from None
+    raise Failure("synthesis failed")
+
+
+def read_text() -> str:
+    path = setting("TALK_SPEAKFILE")
+    if not path:
+        raise Failure("TALK_SPEAKFILE is not set")
+    return Path(path).read_text(encoding="utf-8")
+
+
+def write_atomically(path: Path, data: bytes) -> None:
+    partial = path.with_name(path.name + ".part")
+    partial.write_bytes(data)
+    os.replace(partial, path)
+
+
+def stream(outdir: str) -> None:
+    directory = Path(outdir)
+    directory.mkdir(parents=True, exist_ok=True)
+    for stale in directory.iterdir():
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    chunks = split_text(read_text(), CHUNK_LIMIT, FIRST_LIMIT)
+    try:
+        with ThreadPoolExecutor(max_workers=JOBS) as pool:
+            for index, audio in enumerate(pool.map(synthesize, chunks)):
+                write_atomically(directory / f"{index:03d}.{EXTENSION}", audio)
+    except Exception:
+        # Without this marker the player would sit through its whole timeout
+        # waiting for a first chunk that is never coming.
+        (directory / "ERR").touch()
+        raise
+    (directory / "END").touch()
+
+
+def single(outfile: str) -> None:
+    chunks = split_text(read_text(), CHUNK_LIMIT, CHUNK_LIMIT)
+    with ThreadPoolExecutor(max_workers=JOBS) as pool:
+        audio = b"".join(pool.map(synthesize, chunks))
+    write_atomically(Path(outfile), audio)
+
+
+def voices() -> None:
+    for voice in sorted(call("voices").get("voices", []), key=lambda v: v["name"]):
+        print(
+            f'{voice["name"]}\t{",".join(voice.get("languageCodes", []))}'
+            f'\t{voice.get("ssmlGender", "")}'
+        )
+
+
+def check() -> None:
+    found = call(f"voices?{urllib.parse.urlencode({'languageCode': LANGUAGE})}")
+    count = len(found.get("voices", []))
+    print(f'key works — {count} voice{"" if count == 1 else "s"} for {LANGUAGE}')
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "check"
+    try:
+        KEY = api_key()
+        if mode == "stream":
+            stream(sys.argv[2])
+        elif mode == "single":
+            single(sys.argv[2])
+        elif mode == "voices":
+            voices()
+        elif mode == "check":
+            check()
+        else:
+            raise Failure(f"unknown mode {mode}")
+    except Failure as failure:
+        print(f"talk: {failure}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.HTTPError as error:
+        print(f"talk: {message_of(error)}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as error:
+        print(f"talk: could not reach Google Cloud: {error.reason}", file=sys.stderr)
+        sys.exit(1)
+PY
+  chmod 700 "$CLIENT.part" && mv -f "$CLIENT.part" "$CLIENT"
+}
+
+# The key travels in the environment, which only this user can read. A command
+# line argument would be readable by everyone on the machine.
+google_env() {
+  export TALK_GOOGLE_KEY="${TALK_GOOGLE_KEY:-}"
+  export TALK_GOOGLE_KEY_FILE="$GOOGLE_KEY_FILE"
+  export TALK_GOOGLE_VOICE="${VOICE_OVERRIDE:-$GOOGLE_VOICE}"
+  export TALK_GOOGLE_LANG="$GOOGLE_LANG"
+  export TALK_GOOGLE_SPEED="${GOOGLE_SPEED:-$(rate_to_speed)}"
+  export TALK_GOOGLE_PITCH="$GOOGLE_PITCH"
+  export TALK_GOOGLE_PROFILE="$GOOGLE_PROFILE"
+  export TALK_GOOGLE_JOBS="$GOOGLE_JOBS"
+  export TALK_GOOGLE_ENCODING="$GOOGLE_ENCODING"
+  export TALK_GOOGLE_EXT="$STREAM_EXT"
+  export TALK_GOOGLE_CHUNK="$GOOGLE_CHUNK"
+  export TALK_GOOGLE_FIRST_CHUNK="$GOOGLE_FIRST_CHUNK"
+  export TALK_GOOGLE_TIMEOUT="$GOOGLE_TIMEOUT"
+  export TALK_SPEAKFILE="$SPEAKFILE"
+  [[ -n "${TALK_GOOGLE_API:-}" ]] && export TALK_GOOGLE_API
+  return 0
+}
+
+google_client()    { write_google_client && google_env && python3 "$CLIENT" "$@"; }
+google_client_bg() { write_google_client && google_env && bg python3 "$CLIENT" "$@"; }
+
 # Internal entry points. The streaming loops run as detached background jobs,
 # and re-entering this same file keeps them in one place instead of a second
 # installed script.
@@ -318,14 +658,14 @@ while [[ $# -gt 0 ]]; do
     --print)       PRINT_ONLY=1; shift ;;
     --engine)      ENGINE="${2:-$ENGINE}"; shift 2 ;;
     --voice)       VOICE_OVERRIDE="${2:-}"; VOICE="${2:-$VOICE}"; shift 2 ;;
-    --speaker)     XTTS_SPEAKER_WAV="${2:-}"; shift 2 ;;
-    --lang)        XTTS_LANG="${2:-$XTTS_LANG}"; shift 2 ;;
+    --lang)        GOOGLE_LANG="${2:-$GOOGLE_LANG}"; shift 2 ;;
+    --key-file)    GOOGLE_KEY_FILE="${2:-$GOOGLE_KEY_FILE}"; shift 2 ;;
     --rate)        RATE="${2:-$RATE}"; shift 2 ;;
-    --speed)       XTTS_SPEED="${2:-$XTTS_SPEED}"; shift 2 ;;
+    --speed)       GOOGLE_SPEED="${2:-$GOOGLE_SPEED}"; shift 2 ;;
     --pitch)       PITCH="${2:-$PITCH}"; shift 2 ;;
     --player)      PLAYER="${2:-$PLAYER}"; shift 2 ;;
-    --warm)        DO_WARM=1; shift ;;
     --list-voices) DO_LIST=1; shift ;;
+    --check-key)   DO_CHECK=1; shift ;;
     --doctor)      DO_DOCTOR=1; shift ;;
     -h|--help)     awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0 ;;
     *)             shift ;;
@@ -333,20 +673,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$ENGINE" in
-  auto|xtts|edge) ;;
-  *) echo "talk: unknown engine '$ENGINE' — use auto, xtts or edge" >&2; exit 1 ;;
+  auto|google|edge) ;;
+  *) echo "talk: unknown engine '$ENGINE' — use auto, google or edge" >&2; exit 1 ;;
 esac
+
+# --- synthesize ------------------------------------------------------------
+# TALK_RATE is an edge-tts percentage. Google takes a speaking rate multiplier
+# instead, so "+18%" becomes 1.18 and the one config knob drives both engines.
+rate_to_speed() {
+  local raw="${RATE//[%+[:space:]]/}"
+  [[ -n "$raw" ]] || raw=0
+  awk -v r="$raw" 'BEGIN { s = 1 + r / 100; if (s < 0.25) s = 0.25; if (s > 4.0) s = 4.0; printf "%.3f", s }'
+}
 
 if [[ "$DO_DOCTOR" -eq 1 ]]; then doctor; exit 0; fi
 
-if [[ "$DO_WARM" -eq 1 ]]; then
-  xtts_ready || { echo "talk: xtts is not installed — run xtts/install-xtts.sh" >&2; exit 1; }
-  exec "$XTTS_PYTHON" "$XTTS_SERVER" preload
+if [[ "$DO_CHECK" -eq 1 ]]; then
+  google_ready || { echo "talk: no Google API key configured — see README" >&2; exit 1; }
+  google_client check; exit $?
 fi
 
 if [[ "$DO_LIST" -eq 1 ]]; then
-  if [[ "$(active_engine)" == xtts ]]; then
-    exec "$XTTS_PYTHON" "$XTTS_SERVER" speakers
+  if [[ "$(active_engine)" == google ]]; then
+    google_client voices; exit $?
   fi
   have edge-tts || { echo "talk: edge-tts not found — pip install edge-tts" >&2; exit 1; }
   exec edge-tts --list-voices
@@ -356,7 +705,7 @@ have jq       || { echo "talk: jq not found"      >&2; exit 1; }
 have python3  || { echo "talk: python3 not found" >&2; exit 1; }
 if [[ "$(active_engine)" == edge ]] && ! have edge-tts; then
   if [[ "$ENGINE" == auto ]]; then
-    echo "talk: no engine available — install xtts (xtts/install-xtts.sh) or edge-tts (pip install edge-tts)" >&2
+    echo "talk: no engine available — add a Google API key (see README) or install edge-tts (pip install edge-tts)" >&2
   else
     echo "talk: edge-tts not found — pip install edge-tts" >&2
   fi
@@ -434,110 +783,89 @@ PY
 
 if [[ "$PRINT_ONLY" -eq 1 ]]; then printf '%s\n' "$TEXT"; exit 0; fi
 
-announce() { echo "Speaking $(wc -w <<<"$TEXT" | tr -d ' ') words as ${VOICE_USED} via ${ENGINE_USED}. (/talk stop to interrupt)"; }
+announce() {
+  local words chars
+  words=$(wc -w <<<"$TEXT" | tr -d ' ')
+  chars=${#TEXT}
+  echo "Speaking $words words / $chars characters as ${VOICE_USED} via ${ENGINE_USED}. (/talk stop to interrupt)"
+}
+
 # Each background job gets its own process group, so stopping playback can
 # take down a loop together with the ffmpeg or player it is currently running.
 bg() {
   if have setsid; then
-    setsid nohup "$@" >/dev/null 2>&1 &
+    setsid nohup "$@" >/dev/null 2>>"$ERRLOG" &
   else
-    nohup "$@" >/dev/null 2>&1 &
+    nohup "$@" >/dev/null 2>>"$ERRLOG" &
   fi
   echo $! >> "$PIDFILE"
   disown 2>/dev/null
 }
 
 # --- offline fallback ------------------------------------------------------
-# edge-tts is a network service. If it is unreachable, use a local voice so
-# /talk still works offline.
+# Both engines are network services. If neither is reachable, use a local voice
+# so /talk still works offline.
 speak_offline() {
   case "$PLATFORM" in
     macos)
       have say || return 1
-      bg say "$TEXT"; echo "Speaking via macOS 'say' (edge-tts unreachable)."; return 0 ;;
+      bg say "$TEXT"; echo "Speaking via macOS 'say' (no network engine reachable)."; return 0 ;;
     wsl)
       have powershell.exe || return 1
       local wintmp lintmp
-      wintmp=$(powershell.exe -NoProfile -Command '$env:TEMP' 2>/dev/null | tr -d '\r') || return 1
+      wintmp=$(win_tmp) || return 1
       lintmp=$(wslpath -u "$wintmp" 2>/dev/null) && [[ -d "$lintmp" ]] || return 1
       printf '%s' "$TEXT" > "$lintmp/claude-talk.txt" || return 1
       bg powershell.exe -NoProfile -Command \
         'Add-Type -AssemblyName System.Speech;
          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer;
          $s.Speak([IO.File]::ReadAllText("$env:TEMP\claude-talk.txt"))'
-      echo "Speaking via Windows SAPI (edge-tts unreachable)."; return 0 ;;
+      echo "Speaking via Windows SAPI (no network engine reachable)."; return 0 ;;
     *)
-      if have spd-say;   then bg spd-say -w "$TEXT"; echo "Speaking via spd-say (edge-tts unreachable)."; return 0; fi
-      if have espeak-ng; then bg espeak-ng "$TEXT";  echo "Speaking via espeak-ng (edge-tts unreachable)."; return 0; fi
+      if have spd-say;   then bg spd-say -w "$TEXT"; echo "Speaking via spd-say (no network engine reachable)."; return 0; fi
+      if have espeak-ng; then bg espeak-ng "$TEXT";  echo "Speaking via espeak-ng (no network engine reachable)."; return 0; fi
       return 1 ;;
   esac
 }
 
-# --- synthesize ------------------------------------------------------------
-# TALK_RATE is an edge-tts percentage. XTTS takes a speed multiplier instead,
-# so "+18%" becomes 1.18 and the one config knob drives both engines.
-rate_to_speed() {
-  local raw="${RATE//[%+[:space:]]/}"
-  [[ -n "$raw" ]] || raw=0
-  awk -v r="$raw" 'BEGIN { s = 1 + r / 100; if (s < 0.5) s = 0.5; if (s > 2.0) s = 2.0; printf "%.3f", s }'
+google_names() {
+  ENGINE_USED="$1"
+  VOICE_USED="${VOICE_OVERRIDE:-$GOOGLE_VOICE}"
 }
 
-synth_xtts() {
-  xtts_ready || return 1
-  AUDIO="$STATE_DIR/speech.wav"
-  local speed voice
-  speed="${XTTS_SPEED:-$(rate_to_speed)}"
-  voice="${VOICE_OVERRIDE:-$XTTS_VOICE}"
-  local args=(say --text-file "$SPEAKFILE" --out "$AUDIO"
-              --language "$XTTS_LANG" --speed "$speed")
-  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
-    args+=(--speaker-wav "$XTTS_SPEAKER_WAV")
-  else
-    args+=(--speaker "$voice")
-  fi
+# Streaming hands the first chunk to the player while the rest are still being
+# fetched. The chunks after the first are synthesized in parallel, so they are
+# all in hand long before the opening sentence finishes playing.
+synth_google_stream() {
+  [[ "$STREAM" == 1 ]] || return 1
+  google_ready || return 1
+  clear_dir "$STREAMDIR" || return 1
   printf '%s' "$TEXT" > "$SPEAKFILE" || return 1
-  timeout "${TALK_XTTS_TIMEOUT:-900}" "$XTTS_PYTHON" "$XTTS_SERVER" "${args[@]}" \
-    >/dev/null 2>"$ERRLOG" || return 1
-  [[ -s "$AUDIO" ]] || return 1
-  ENGINE_USED="XTTS-v2"
-  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
-    VOICE_USED="$(basename "$XTTS_SPEAKER_WAV")"
-  else
-    VOICE_USED="$voice"
-  fi
+  google_client_bg stream "$STREAMDIR" || return 1
+
+  local first wait
+  first=$(printf '%s/000.%s' "$STREAMDIR" "$STREAM_EXT")
+  wait="${TALK_GOOGLE_WAIT:-60}"
+  wait=$((SECONDS + ${wait%%.*}))
+  while (( SECONDS < wait )); do
+    [[ -f "$first" ]] && break
+    [[ -f "$STREAMDIR/ERR" ]] && { stop_playback; return 1; }
+    sleep 0.05
+  done
+  [[ -f "$first" ]] || { stop_playback; return 1; }
+
+  stream_start || { stop_playback; return 1; }
+  google_names "Google Cloud TTS, streaming"
   return 0
 }
 
-# Streaming hands the first chunk to the player while the rest still render.
-# Synthesis runs about twice as fast as speech plays, so the player never
-# starves, and the wait drops from the whole answer to one short sentence.
-synth_xtts_stream() {
-  [[ "$STREAM" == 1 ]] || return 1
-  xtts_ready || return 1
-  local speed voice
-  speed="${XTTS_SPEED:-$(rate_to_speed)}"
-  voice="${VOICE_OVERRIDE:-$XTTS_VOICE}"
-  local args=(stream --text-file "$SPEAKFILE" --outdir "$STREAMDIR"
-              --language "$XTTS_LANG" --speed "$speed")
-  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
-    args+=(--speaker-wav "$XTTS_SPEAKER_WAV")
-  else
-    args+=(--speaker "$voice")
-  fi
+synth_google() {
+  google_ready || return 1
+  AUDIO="$STATE_DIR/speech.mp3"
   printf '%s' "$TEXT" > "$SPEAKFILE" || return 1
-  timeout "${TALK_XTTS_TIMEOUT:-900}" "$XTTS_PYTHON" "$XTTS_SERVER" "${args[@]}" \
-    >/dev/null 2>"$ERRLOG" || return 1
-  [[ -f "$STREAMDIR/000.wav" ]] || return 1
-  if ! stream_start; then
-    "$XTTS_PYTHON" "$XTTS_SERVER" cancel >/dev/null 2>&1
-    return 1
-  fi
-  ENGINE_USED="XTTS-v2, streaming"
-  if [[ -n "$XTTS_SPEAKER_WAV" ]]; then
-    VOICE_USED="$(basename "$XTTS_SPEAKER_WAV")"
-  else
-    VOICE_USED="$voice"
-  fi
+  google_client single "$AUDIO" 2>>"$ERRLOG" || return 1
+  [[ -s "$AUDIO" ]] || return 1
+  google_names "Google Cloud TTS"
   return 0
 }
 
@@ -545,16 +873,17 @@ synth_edge() {
   have edge-tts || return 1
   AUDIO="$STATE_DIR/speech.mp3"
   timeout 120 edge-tts --voice "$VOICE" --rate "$RATE" --pitch "$PITCH" \
-    --text "$TEXT" --write-media "$AUDIO" >/dev/null 2>"$ERRLOG" || return 1
+    --text "$TEXT" --write-media "$AUDIO" >/dev/null 2>>"$ERRLOG" || return 1
   [[ -s "$AUDIO" ]] || return 1
   ENGINE_USED="edge-tts"
   VOICE_USED="$VOICE"
   return 0
 }
 
+# Two engines failing over the same broken key would otherwise report it twice.
 synthesis_failed() {
   echo "talk: synthesis failed" >&2
-  tail -5 "$ERRLOG" >&2
+  tail -5 "$ERRLOG" | awk '!seen[$0]++' >&2
   exit 1
 }
 
@@ -562,16 +891,15 @@ stop_playback
 rm -f "$STATE_DIR/speech.mp3" "$STATE_DIR/speech.wav" "$PLAYWAV"
 : > "$ERRLOG"
 
-[[ "$ENGINE" == edge ]] || { synth_xtts_stream && { announce; exit 0; }; }
-
-case "$ENGINE" in
-  xtts)
-    xtts_ready || { echo "talk: xtts is not installed — run xtts/install-xtts.sh" >&2; exit 1; }
-    synth_xtts || { echo "talk: XTTS synthesis failed" >&2; tail -5 "$ERRLOG" >&2; exit 1; } ;;
+case "$(active_engine)" in
+  google)
+    synth_google_stream && { announce; exit 0; }
+    if ! synth_google; then
+      [[ "$ENGINE" == auto ]] || synthesis_failed
+      synth_edge || { speak_offline && exit 0; synthesis_failed; }
+    fi ;;
   edge)
     synth_edge || { speak_offline && exit 0; synthesis_failed; } ;;
-  auto)
-    synth_xtts || synth_edge || { speak_offline && exit 0; synthesis_failed; } ;;
 esac
 
 # --- playback --------------------------------------------------------------
@@ -582,8 +910,7 @@ esac
 play_windows() {
   have powershell.exe && have wslpath && have ffmpeg || return 1
   local wintmp lintmp
-  wintmp=$(powershell.exe -NoProfile -Command '$env:TEMP' 2>/dev/null | tr -d '\r')
-  [[ -n "$wintmp" ]] || return 1
+  wintmp=$(win_tmp) || return 1
   lintmp=$(wslpath -u "$wintmp" 2>/dev/null) && [[ -d "$lintmp" ]] || return 1
   # SoundPlayer needs PCM WAV; 48 kHz is what the Windows mixer runs natively
   ffmpeg -y -loglevel error -i "$AUDIO" \
@@ -599,11 +926,8 @@ play_macos() { have afplay && bg afplay "$AUDIO"; }
 # Match the sink's exact format so the sound server resamples nothing — a
 # cheap inline resampler on a non-integer ratio is a classic source of clicks.
 play_linux() {
-  local rate ch spec
-  spec=$(pactl info 2>/dev/null | sed -n 's/^Default Sample Specification:[[:space:]]*//p')
-  rate=$(grep -oE '[0-9]+Hz' <<<"$spec" | tr -d 'Hz')
-  ch=$(grep -oE '[0-9]+ch' <<<"$spec" | tr -d 'ch')
-  : "${rate:=48000}" "${ch:=2}"
+  local rate ch
+  read -r rate ch < <(sink_format)
 
   if have ffmpeg && { have paplay || have pw-play; }; then
     if ffmpeg -y -loglevel error -i "$AUDIO" \

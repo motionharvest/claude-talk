@@ -11,7 +11,7 @@ Like `/copy`, but for your ears. Useful when you want to keep reading code while
 /talk --doctor     check your audio setup
 ```
 
-Two speech engines are available. `edge-tts` calls Microsoft's cloud voices and needs a network. XTTS-v2 runs on your own machine, needs no network at speak time, and can clone a voice from a short recording. `/talk` prefers XTTS-v2 when it is installed and falls back to `edge-tts` when it is not.
+Two speech engines are available. Google Cloud Text-to-Speech needs an API key and bills per character; it streams, so speech starts while the rest of the answer is still being synthesized. `edge-tts` calls Microsoft's cloud voices, is free and needs no key, and waits for the whole answer before it starts. `/talk` uses Google when a key is configured and falls back to `edge-tts` when it isn't.
 
 ## Install
 
@@ -26,69 +26,82 @@ Or clone and run `./install.sh`. Both drop two files into `~/.claude/`:
 ~/.claude/commands/talk.md   the slash command
 ```
 
+The installer offers to take a Google API key and writes it to `~/.config/claude-talk/google-api-key` with `600` permissions. Skip it and `/talk` uses `edge-tts` instead.
+
 Start a new session and `/talk` is available. To remove it, run `./uninstall.sh`.
 
-### Local voices with XTTS-v2
+### Google Cloud Text-to-Speech
 
-The base install uses `edge-tts`. To add the local engine:
+Create a project in the [Google Cloud console](https://console.cloud.google.com), enable the **Cloud Text-to-Speech API** on it, then make an API key under *APIs & Services → Credentials*. The key is what `/talk` needs; there is no OAuth flow and no service account file.
+
+If you skipped the installer prompt:
 
 ```bash
-./xtts/install-xtts.sh
+mkdir -p ~/.config/claude-talk
+printf '%s' 'YOUR_KEY' > ~/.config/claude-talk/google-api-key
+chmod 600 ~/.config/claude-talk/google-api-key
 ```
 
-That builds a virtualenv under `~/.local/share/claude-talk/venv`, installs PyTorch and `coqui-tts` into it, downloads the XTTS-v2 checkpoint, and copies the server to `~/.claude/talk-xtts.py`. It asks you to accept the model license first and installs nothing if you decline. Expect roughly 8 GB of disk and a long first run.
+`/talk --check-key` confirms the key works and reports how many voices it can reach. `/talk --list-voices` names them all — several hundred, across most languages, in tiers that sound and cost differently. The default is `en-US-Neural2-F`; set another with `TALK_GOOGLE_VOICE`.
 
-Once it is installed, `/talk` uses it by default. `/talk --engine edge` goes back to the cloud voice for one run, and `TALK_ENGINE=edge` makes that permanent.
+The key is never passed as a command line argument, so it never appears in `ps` output or in your shell history. `talk.sh` doesn't read it either — it hands the path to the synthesis client, which is the only process that sees the contents.
 
-XTTS-v2 takes ten to twenty seconds to load, so the server holds the model in memory between requests and exits after fifteen minutes of silence. `/talk --warm` loads it ahead of time. The daemon listens on a unix socket in the runtime directory, not on a network port.
+**Billing.** Google bills per character synthesized, at a rate that depends on the voice tier, and gives a free monthly allowance per tier. Both are on the [pricing page](https://cloud.google.com/text-to-speech/pricing); check it before you point this at long answers. `/talk` prints the character count it sent every time it speaks, and `TALK_MAXLEN` caps how much of an answer it will read at all.
 
-Playback streams. The server renders the answer in chunks and `/talk` starts playing the first one while the rest are still being made. Synthesis runs about twice as fast as speech plays back, so the player never runs dry. On a warm daemon the first word arrives in about a second for a short answer and under four for a long one, rather than scaling with the length of the answer. Chunks always break at sentence boundaries in ordinary prose. `TALK_STREAM=0` restores the older behaviour of waiting for the complete file.
+**Voices that refuse speed and pitch.** Some tiers — Chirp and Studio among them — reject `speakingRate` and `pitch`. `/talk` doesn't try to predict which: it sends them, and if the API rejects them it drops both and re-sends, for the rest of that run. So `TALK_GOOGLE_VOICE=en-US-Chirp3-HD-Aoede` works, it just ignores `TALK_RATE`.
 
-**Cloning a voice.** Record 6 to 30 seconds of clean speech as a wav file, then set `TALK_XTTS_SPEAKER_WAV=/path/to/voice.wav`. `/talk --speaker /path/to/voice.wav` does the same for one run. Without a clip, `/talk` uses a built-in speaker, and `/talk --list-voices` names all of them.
+### Streaming
 
-**License.** XTTS-v2 is published under the [Coqui Public Model License](https://coqui.ai/cpml), which permits non-commercial use only. `edge-tts` is the engine to use for commercial work.
+Google synthesis streams. `talk.sh` splits the answer at sentence boundaries, sends the opening 180 characters as its own request, and starts playing that chunk the moment it lands. The rest go out in parallel — four requests at a time by default — so they are all in hand long before the opening sentence finishes playing. First word in about a second, whatever the length of the answer.
+
+`TALK_STREAM=0` waits for the whole answer instead and plays one file. `edge-tts` always works that way; it has no streaming mode here.
 
 ### Requirements
 
 | | |
 |---|---|
-| `edge-tts` | `pip install edge-tts` — neural voices, free, no API key |
 | `jq` | reads the session transcript |
-| `python3` | strips markdown down to speakable prose |
+| `python3` | strips markdown, and talks to the Google API |
 | `ffmpeg` | recommended; required on WSL |
-
-XTTS-v2 adds its own requirements, all installed into its own virtualenv by `xtts/install-xtts.sh`: PyTorch, `coqui-tts`, and about 2 GB for the checkpoint. A CUDA GPU is optional. On CPU the model runs, and it runs slower than speech plays back, so a long answer will not start immediately.
+| `edge-tts` | `pip install edge-tts` — only for the free fallback engine |
 
 Plus something to make sound, which you almost certainly already have: `afplay` on macOS, `paplay`/`pw-play`/`ffplay`/`mpv` on Linux, and on WSL nothing extra — it plays through Windows.
 
-`edge-tts` needs a network connection. If it can't reach Microsoft's endpoint, `/talk` falls back to a local voice automatically (`say` on macOS, Windows SAPI on WSL, `spd-say`/`espeak-ng` on Linux).
+Both engines need a network connection. If neither is reachable, `/talk` falls back to a local voice automatically (`say` on macOS, Windows SAPI on WSL, `spd-say`/`espeak-ng` on Linux).
 
 ## Configuration
 
 Environment variables, or `~/.config/claude-talk/config` (plain shell syntax):
 
 ```bash
-TALK_ENGINE=auto             # auto | xtts | edge; auto prefers xtts
-TALK_VOICE=en-US-GuyNeural   # default en-US-AriaNeural; edge only
+TALK_ENGINE=auto             # auto | google | edge; auto prefers google
 TALK_RATE=+30%               # default +18%; negative slows down
-TALK_PITCH=-5Hz              # default +0Hz; edge only
 TALK_MAXLEN=6000             # chars before truncating at a sentence boundary
 TALK_PLAYER=auto             # auto | windows | linux | macos
+TALK_STREAM=1                # 0 waits for the whole file before playing
 TALK_LATENCY_MSEC=200        # PulseAudio buffer, Linux route only
 
-TALK_XTTS_VOICE="Ana Florence"        # default "Claribel Dervla"
-TALK_XTTS_SPEAKER_WAV=~/voice.wav     # clone this voice instead
-TALK_XTTS_LANG=en                     # default en
-TALK_XTTS_SPEED=1.2                   # overrides TALK_RATE for xtts
-TALK_XTTS_IDLE=900                    # seconds idle before the model unloads
-TALK_STREAM=1                         # 0 waits for the whole file before playing
+TALK_GOOGLE_VOICE=en-US-Neural2-D   # default en-US-Neural2-F
+TALK_GOOGLE_KEY_FILE=~/keys/gcp     # default ~/.config/claude-talk/google-api-key
+TALK_GOOGLE_LANG=en-GB              # default: the language in the voice name
+TALK_GOOGLE_SPEED=1.2               # overrides TALK_RATE for google
+TALK_GOOGLE_PITCH=-2                # semitones, -20 to 20; default 0
+TALK_GOOGLE_JOBS=4                  # parallel synthesis requests
+TALK_GOOGLE_ENCODING=MP3            # MP3 | OGG_OPUS | LINEAR16
+TALK_GOOGLE_FIRST_CHUNK=180         # chars in the opening chunk
+TALK_GOOGLE_CHUNK=700               # chars per request after that
+
+TALK_VOICE=en-US-GuyNeural   # edge only; default en-US-AriaNeural
+TALK_PITCH=-5Hz              # edge only; default +0Hz
 ```
 
-Override per-invocation too: `/talk --voice en-GB-RyanNeural --rate +40%`.
+`TALK_GOOGLE_KEY` holds the key itself, if you would rather keep it in the environment than in a file. Anything that can read your environment can read it, so the file is the better default.
 
-`TALK_RATE` drives both engines. XTTS takes a multiplier rather than a percentage, so `/talk` converts `+18%` to `1.18` and clamps the result to the range 0.5 to 2.0.
+Override per-invocation too: `/talk --voice en-US-Studio-O --rate +40%`.
 
-`/talk --list-voices` lists the active engine's voices. For `edge-tts` that is several hundred across most languages. For XTTS-v2 it is the built-in speakers in the checkpoint.
+`TALK_RATE` drives both engines. Google takes a multiplier rather than a percentage, so `/talk` converts `+18%` to `1.18` and clamps the result to the range 0.25 to 4.0.
+
+`/talk --list-voices` lists the active engine's voices: name, language codes and gender for Google, `edge-tts --list-voices` output for edge.
 
 ## How it works
 
@@ -98,39 +111,39 @@ Getting *the last response* right takes a little care. A turn's transcript isn't
 
 The text then goes through a markdown-to-prose pass, because code fences and tables are miserable to listen to: fenced code becomes "Code block omitted", links collapse to their text, and headings, bullets, emphasis and emoji are stripped.
 
+What reaches Google is a small Python client that `talk.sh` writes into its runtime directory at speak time. It does the sentence splitting, the parallel HTTP and the base64 decode in one process, and it is the only thing that ever holds the API key. Nothing is installed for it and there is no daemon to warm up.
+
 The slash command uses Claude Code's `` !`...` `` syntax, so the script runs at expansion time rather than as a tool call. No model round-trip, no risk of Claude narrating over it.
 
 ## Notes on audio quality
 
 Two problems worth knowing about, since both produce the same symptom — clicking and popping — for entirely different reasons.
 
-**Sample-rate mismatch.** `edge-tts` returns 24 kHz mono. If your sound server runs at 44.1 kHz, it has to resample by a ratio of 147/80, and a cheap inline resampler on a non-integer ratio audibly clicks. The script converts to the sink's exact format up front using [soxr](https://sourceforge.net/projects/soxr/) at 28-bit precision, so the sound server resamples nothing. You can confirm it worked — `pactl list sink-inputs` should report `Resample method: n/a` during playback.
+**Sample-rate mismatch.** Google returns 24 kHz mono. If your sound server runs at 44.1 kHz, it has to resample by a ratio of 147/80, and a cheap inline resampler on a non-integer ratio audibly clicks. The script converts to the sink's exact format up front using [soxr](https://sourceforge.net/projects/soxr/) at 28-bit precision, so the sound server resamples nothing. You can confirm it worked — `pactl list sink-inputs` should report `Resample method: n/a` during playback.
 
-**WSLg's `RDPSink`.** Under WSL the Linux sink streams audio to Windows over RDP with no buffer headroom. It starves partway through and crackles no matter how the stream is formatted — the giveaway is playback that starts clean and degrades. No Linux-side buffer setting fully fixes it, so on WSL the script hands the file to Windows and lets the native audio stack play it, taking WSLg out of the path entirely. That costs about a second before speech starts, for an 8 MB WAV copy into the Windows temp directory.
+**WSLg's `RDPSink`.** Under WSL the Linux sink streams audio to Windows over RDP with no buffer headroom. It starves partway through and crackles no matter how the stream is formatted — the giveaway is playback that starts clean and degrades. No Linux-side buffer setting fully fixes it, so on WSL the script hands the audio to Windows and lets the native audio stack play it, taking WSLg out of the path entirely.
 
 If you're using some other TTS setup on WSL and hearing the same grit, this is very likely why.
 
 ## Troubleshooting
 
-`/talk --doctor` reports the detected platform, every dependency, your sink format, and the resolved transcript path.
+`/talk --doctor` reports the detected platform, every dependency, your sink format, whether a Google key was found and works, and the resolved transcript path.
 
 **Nothing plays.** Check `--doctor` found a player. On Linux, `sudo apt install ffmpeg pulseaudio-utils` covers it.
+
+**"API key not valid".** The key is wrong, or the Cloud Text-to-Speech API isn't enabled on the project the key belongs to. Enabling it takes a minute to propagate. `/talk --check-key` tests it on its own.
 
 **Crackling on WSL.** Should be handled automatically. If it persists, `TALK_PLAYER=linux /talk` uses the PulseAudio route instead, and `TALK_LATENCY_MSEC=400` gives it a bigger buffer.
 
 **"could not find session transcript".** `CLAUDE_CODE_SESSION_ID` is only set inside Claude Code — expected if you ran `talk.sh` straight from a terminal.
 
-**It spoke the wrong thing.** `/talk --print` shows exactly what the extractor picked up without making any sound.
+**It spoke the wrong thing.** `/talk --print` shows exactly what the extractor picked up without making any sound, and without spending any characters.
 
-**XTTS is installed but `/talk` still uses edge.** `/talk --doctor` prints the resolved engine and both paths it looks for. It needs `~/.claude/talk-xtts.py` and an executable python at `~/.local/share/claude-talk/venv/bin/python`.
+**A key is configured but `/talk` still uses edge.** `/talk --doctor` prints the resolved engine and where it looked for the key. An empty key file counts as no key.
 
-**XTTS synthesis fails.** Run `~/.local/share/claude-talk/venv/bin/python ~/.claude/talk-xtts.py status` for the model and daemon state. The daemon writes its own log next to the audio, in `$XDG_RUNTIME_DIR/claude-talk/xtts.log`.
+**Speech stutters or pauses mid-answer.** Streaming ran out of chunks, which means a request was slow. Raise `TALK_GOOGLE_JOBS` so more of them are in flight, or set `TALK_STREAM=0` to wait for the whole answer.
 
-**XTTS speech cuts off.** XTTS-v2 truncates any input longer than roughly 250 characters, so the server splits text at sentence boundaries and joins the audio afterwards. A cut-off answer means a chunk was dropped rather than truncated, which the log will show.
-
-**Speech stutters or pauses mid-answer.** Streaming ran out of chunks, which means synthesis fell behind playback. The opening chunk has a floor of 110 characters precisely to stop that happening at the start. If it still happens, synthesis on your machine is slower than speech plays, which is normal on a CPU. Set `TALK_STREAM=0` to wait for the whole file instead.
-
-**`/talk` right after `/talk stop` is slow.** A cancelled stream finishes the chunk it is already rendering before releasing the model, which costs up to about five seconds. Waiting a moment, or letting the answer finish rather than stopping it, avoids the delay.
+**`/talk` costs more than expected.** Every `/talk` re-synthesizes the whole answer — there is no cache. `--print` is free, `TALK_MAXLEN` caps the ceiling, and Standard voices cost a fraction of the neural tiers.
 
 ## License
 

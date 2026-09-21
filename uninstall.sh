@@ -4,22 +4,24 @@ set -euo pipefail
 
 "$HOME/.claude/talk.sh" stop >/dev/null 2>&1 || true
 
-VENV="${XDG_DATA_HOME:-$HOME/.local/share}/claude-talk/venv"
-if [[ -x "$VENV/bin/python" && -f "$HOME/.claude/talk-xtts.py" ]]; then
-  "$VENV/bin/python" "$HOME/.claude/talk-xtts.py" stop >/dev/null 2>&1 || true
-fi
-
-for f in "$HOME/.claude/talk.sh" "$HOME/.claude/commands/talk.md" "$HOME/.claude/talk-xtts.py"; do
+for f in "$HOME/.claude/talk.sh" "$HOME/.claude/commands/talk.md"; do
   if [[ -e "$f" ]]; then rm -f "$f"; echo "removed $f"; fi
   if [[ -e "$f.bak" ]]; then mv "$f.bak" "$f"; echo "restored $f from backup"; fi
 done
 
-rm -rf "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/claude-talk"
-echo "done — config at ~/.config/claude-talk left in place"
+# Left over from the versions that shipped a local XTTS engine.
+XTTS_VENV="${XDG_DATA_HOME:-$HOME/.local/share}/claude-talk"
+if [[ -e "$HOME/.claude/talk-xtts.py" ]]; then
+  rm -f "$HOME/.claude/talk-xtts.py"
+  echo "removed $HOME/.claude/talk-xtts.py"
+fi
 
-if [[ -d "$VENV" ]]; then
+rm -rf "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/claude-talk"
+echo "done — config and API key at ~/.config/claude-talk left in place"
+
+if [[ -d "$XTTS_VENV" ]]; then
   echo
-  echo "the XTTS virtualenv and model were left in place; remove them with:"
-  echo "  rm -rf ${XDG_DATA_HOME:-$HOME/.local/share}/claude-talk"
+  echo "the old XTTS virtualenv and model are still on disk; remove them with:"
+  echo "  rm -rf $XTTS_VENV"
   echo "  rm -rf ${XDG_DATA_HOME:-$HOME/.local/share}/tts/tts_models--multilingual--multi-dataset--xtts_v2"
 fi
